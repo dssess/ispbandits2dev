@@ -16,6 +16,7 @@ import tarfile
 from . import __version__, database, backup
 from . import collector
 from . import sessions
+from . import system_monitor
 from . import xray_config
 from . import provisioning
 from . import ssh_meter
@@ -880,40 +881,22 @@ def _renew_managed_tls() -> None:
 
 
 def _host_bandwidth() -> None:
-    try:
-        lines = Path("/proc/net/dev").read_text(encoding="ascii").splitlines()[2:]
-    except OSError as exc:
-        raise RuntimeError("Host interface counters are unavailable") from exc
-    received = transmitted = 0
-    interfaces = 0
-    for line in lines:
-        name, separator, counters = line.partition(":")
-        if not separator or name.strip() == "lo":
-            continue
-        values = counters.split()
-        if len(values) < 9:
-            continue
-        try:
-            received += int(values[0])
-            transmitted += int(values[8])
-            interfaces += 1
-        except ValueError:
-            continue
-    if not interfaces:
-        raise RuntimeError("No non-loopback interface counters were readable")
-
-    def humanize(value: int) -> str:
-        amount = float(value)
-        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-            if amount < 1024 or unit == "TiB":
-                return f"{amount:.2f} {unit}"
-            amount /= 1024
-        return f"{amount:.2f} TiB"
-
-    print(f"Host interface totals across {interfaces} non-loopback interface(s):")
-    print(f"  Received: {humanize(received)}")
-    print(f"  Sent:     {humanize(transmitted)}")
-    print("These are host counters since boot/counter reset, not daily or per-user usage.")
+    snapshot = system_monitor.bandwidth_snapshot()
+    if snapshot["source"] == "vnstat":
+        print(f"Host bandwidth estimates for {snapshot['interface']} (vnStat):")
+        print(f"  Today: {snapshot['daily']} (received {snapshot['received']}, sent {snapshot['sent']})")
+        print(f"  Month: {snapshot['monthly']} ({snapshot['month']})")
+        print("Host-interface totals; not per-user traffic or exact account quota usage.")
+        return
+    if snapshot["source"] == "kernel-since-boot":
+        received = system_monitor.humanize_bytes(int(snapshot["received_bytes"]))
+        sent = system_monitor.humanize_bytes(int(snapshot["sent_bytes"]))
+        print(f"Host interface counters across {snapshot['interface']}:")
+        print(f"  Received since boot/counter reset: {received}")
+        print(f"  Sent since boot/counter reset:     {sent}")
+        print("Daily/monthly totals unavailable (vnStat not reporting); not per-user usage.")
+        return
+    raise RuntimeError("Host network usage is unavailable: neither vnStat nor kernel interface counters could be read")
 
 
 def _process_list() -> None:
@@ -1118,10 +1101,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{row['username']:<20} {row['status']:<14} up={row['upload_bytes']} down={row['download_bytes']} measured={row['measured_bytes']} legacy={row['legacy_bytes']} quota={quota} expires={row['expiry_date']}")
         elif args.command == "online":
             rows = sessions.online_ssh_processes(path)
-            print("Online SSH/Dropbear status — observed daemon processes; approximate, not unique device counts")
+            print("ACTIVE SSH/Dropbear SESSIONS — observed daemon processes (approximate; not unique device counts)")
             print(f"Sampled at: {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}")
             if not rows:
-                print("No enabled SSH/Dropbear protocol accounts found.")
+                print("No active SSH/Dropbear processes observed.")
             else:
                 print(f"{'USERNAME':<20} {'PROTOCOL':<10} {'OBSERVED PROCESSES':>18}")
                 for row in rows:

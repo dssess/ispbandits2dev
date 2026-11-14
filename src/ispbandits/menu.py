@@ -15,8 +15,9 @@ import sqlite3
 import socket
 import subprocess
 import sys
+import time
 
-from . import database
+from . import database, sessions, system_monitor
 from . import menu_actions, menu_ui
 from .menu_ui import show_result
 
@@ -338,6 +339,30 @@ def _cpu_details() -> tuple[str, str]:
     return model, f"{cores} Cores @ {frequency} ({load})"
 
 
+def _cpu_usage_percent(interval: float = 0.1) -> str:
+    """Measure aggregate CPU busy time from procfs over a short bounded interval."""
+    def counters() -> tuple[int, int]:
+        line = Path("/proc/stat").read_text(encoding="ascii").splitlines()[0]
+        values = [int(value) for value in line.split()[1:]]
+        if len(values) < 4:
+            raise ValueError("incomplete CPU counters")
+        total = sum(values)
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return total, idle
+
+    try:
+        first_total, first_idle = counters()
+        time.sleep(max(0.0, min(0.25, interval)))
+        second_total, second_idle = counters()
+        elapsed = second_total - first_total
+        if elapsed <= 0:
+            return "unavailable"
+        busy = max(0, elapsed - (second_idle - first_idle))
+        return f"{max(0, min(100, round(busy * 100 / elapsed)))}% (sample)"
+    except (OSError, ValueError, IndexError, ZeroDivisionError):
+        return "unavailable"
+
+
 def _uptime_readable() -> str:
     try:
         seconds = int(float(Path("/proc/uptime").read_text(encoding="ascii").split()[0]))
@@ -369,6 +394,8 @@ def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
         kernel = "unknown"
     counts = _database_counts(db_path)
     cpu_name, cpu_info = _cpu_details()
+    bandwidth = system_monitor.bandwidth_snapshot()
+    ssh_sessions = _online_ssh_snapshot(db_path)
     total = str(counts.get("total", "unavailable")) if counts else "unavailable"
     active = str(counts.get("active", "unavailable")) if counts else "unavailable"
     disabled = str(counts.get("disabled", "unavailable")) if counts else "unavailable"
@@ -379,11 +406,34 @@ def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
         f"Kernel          : {kernel}",
         f"CPU Name        : {cpu_name}",
         f"CPU Info        : {cpu_info}",
+        f"CPU Usage       : {_cpu_usage_percent()}",
         f"Total RAM       : {_memory()} ({_memory_percent()})",
         f"System Uptime   : {_uptime_readable()}",
         f"Current Domain  : {_domain()}",
         f"IP-VPS          : {_public_interface_ip()}",
+        f"Storage         : {_storage_summary()}",
     ]
+    if bandwidth["source"] == "vnstat":
+        overview.extend([
+            f"Daily Bandwidth : {bandwidth['daily']} ({bandwidth['interface']}, vnStat)",
+            f"Monthly Bandwidth: {bandwidth['monthly']} ({bandwidth['month']})",
+        ])
+    elif bandwidth["source"] == "kernel-since-boot":
+        overview.append(
+            "Host Traffic    : since boot/reset "
+            f"RX {system_monitor.humanize_bytes(int(bandwidth['received_bytes']))} / "
+            f"TX {system_monitor.humanize_bytes(int(bandwidth['sent_bytes']))}"
+        )
+    else:
+        overview.append("Host Bandwidth  : unavailable")
+    if ssh_sessions is None:
+        overview.append("Online SSH      : unavailable (root process scan required)")
+    else:
+        process_count = sum(int(row["observed_processes"]) for row in ssh_sessions)
+        overview.append(
+            f"Online SSH      : {len(ssh_sessions)} active username(s), "
+            f"{process_count} observed process(es) (approximate)"
+        )
     account_rows = [
         f"TOTAL ACCOUNTS     {total}",
         f"ACTIVE ACCOUNTS    {active}",
@@ -408,7 +458,16 @@ def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
     health.append(("DATABASE", "available" if counts is not None else "unavailable"))
     protocol_counts = counts.get("protocol_counts") if counts else None
     return {"overview": overview, "health": health, "accounts": account_rows,
-            "protocol_counts": protocol_counts}
+            "protocol_counts": protocol_counts,
+            "ssh_sessions": ssh_sessions}
+
+
+def _online_ssh_snapshot(db_path: Path) -> list[dict[str, object]] | None:
+    """Return active managed SSH/Dropbear process rows; None means not inspectable."""
+    try:
+        return sessions.online_ssh_processes(db_path)
+    except (OSError, sqlite3.Error, PermissionError, ValueError):
+        return None
 
 
 _QUICK_ACTION_LABELS = tuple(
@@ -677,13 +736,31 @@ def _section_extra(db_path: Path, section: str) -> list[str | tuple[str, str]]:
             ("Full quota collector timer", lambda: _service_state("ispbandits-ssh-collect.timer")),
         ]
         timer_states = _collect_checks(timer_checks)
-        return [
+        session_rows = _online_ssh_snapshot(db_path)
+        rows: list[str | tuple[str, str]] = [
+            ("ACTIVE SSH SESSIONS (process-based estimate)", "cyan"),
+        ]
+        if session_rows is None:
+            rows.append(("Live session scan unavailable; run menu as root.", "yellow"))
+        elif not session_rows:
+            rows.append(("No active SSH/Dropbear processes observed.", "yellow"))
+        else:
+            rows.append(("USERNAME                 PROTOCOL   OBSERVED PROCESSES", "cyan"))
+            for item in session_rows:
+                rows.append((
+                    f"{str(item['username']):<24} {str(item['protocol']).upper():<10} "
+                    f"{int(item['observed_processes']):>4}",
+                    "green",
+                ))
+        rows.extend([
             (f"{label}: {timer_states.get(label, 'unavailable')}",
              menu_ui.state_color(timer_states.get(label, "unavailable")))
             for label, _ in timer_checks
         ] + [
+            "Process counts are approximate and do not identify unique devices.",
             "Quota sampling is not a hard real-time byte cap.",
-        ]
+        ])
+        return rows
     if section == "O":
         return ["SERVER INFORMATION"] + list(_dashboard_snapshot(db_path)["overview"])
     if section == "S":
@@ -737,6 +814,7 @@ def run_menu(db_path: Path) -> int:
                 _show_dashboard(db_path)
                 choice = input().strip()
                 if choice in menu_actions.EXIT_KEYS:
+                    menu_ui.clear_screen()
                     print("Goodbye.")
                     return 0
                 normalized = choice.upper()
@@ -760,6 +838,7 @@ def run_menu(db_path: Path) -> int:
                     section = None
                     continue
                 if choice.upper() in {"Q", "X"}:
+                    menu_ui.clear_screen()
                     print("Goodbye.")
                     return 0
                 if choice.upper() == "R":
@@ -787,6 +866,7 @@ def run_menu(db_path: Path) -> int:
                 section = "L"
                 continue
             if choice in menu_actions.EXIT_KEYS:
+                menu_ui.clear_screen()
                 print("Goodbye.")
                 return 0
             result = _dispatch_section_action(db_path, section, choice)
@@ -796,6 +876,7 @@ def run_menu(db_path: Path) -> int:
                 show_result(*result)
             _pause()
         except (EOFError, KeyboardInterrupt):
+            menu_ui.clear_screen()
             print("\nExiting Neverbandits.")
             return 0
 

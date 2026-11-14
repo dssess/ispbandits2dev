@@ -72,7 +72,7 @@ REFERENCE_MENU: tuple[ReferenceOption, ...] = (
     ReferenceOption("14", "RUNNING STATUS", 6, True, "Shows systemd and local endpoint diagnostics; external client access is not tested"),
     ReferenceOption("15", "USER BANDWIDTH", 4, True, "Shows stored per-account traffic counters"),
     ReferenceOption("16", "SPEEDTEST", None, False, "No speed-test backend is installed"),
-    ReferenceOption("17", "CHECK BANDWIDTH", "bandwidth", True, "Shows host interface counters since boot; not per-user or daily usage"),
+    ReferenceOption("17", "CHECK BANDWIDTH", "bandwidth", True, "Shows vnStat host totals for today and this month when available; never per-user quota usage"),
     ReferenceOption("18", "LIMIT SPEED", None, False, "Per-user rate limiting is not implemented"),
     ReferenceOption("19", "WEBMIN", None, False, "Webmin is not installed or managed by this release"),
     ReferenceOption("20", "INFO SCRIPT", "about", True, "Shows ISPBandits publisher, version, and license notice", dashboard=False),
@@ -106,7 +106,7 @@ SECTIONS: dict[str, dict[str, object]] = {
     },
     "T": {
         "title": "TRAFFIC & QUOTA",
-        "description": "Usage, approximate SSH process monitoring, and limits",
+        "description": "Host bandwidth estimates, active SSH process monitoring, and account quotas",
         "actions": (4, 5, 10),
     },
     "O": {

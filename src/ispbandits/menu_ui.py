@@ -36,9 +36,14 @@ def paint(text: str, color: str | None) -> str:
 
 
 def clear_screen() -> None:
-    """Clear only a real, ANSI-capable terminal; never invoke a shell command."""
-    if sys.stdout.isatty() and os.environ.get("TERM") not in {None, "", "dumb"}:
+    """Replace the visible terminal page, with a plain scroll fallback for TERM=dumb."""
+    if not sys.stdout.isatty():
+        return
+    if os.environ.get("TERM") not in {None, "", "dumb"}:
         print("\033[2J\033[H", end="", flush=True)
+        return
+    _, lines = _dimensions()
+    print("\n" * max(24, lines), end="", flush=True)
 
 
 def _unicode_supported() -> bool:

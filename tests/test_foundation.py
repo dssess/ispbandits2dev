@@ -199,6 +199,40 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual("openssh", rows[0]["protocol"])
         self.assertEqual(3, rows[0]["observed_processes"])
 
+    def test_online_view_omits_managed_users_without_active_processes(self):
+        account = pwd.getpwuid(os.getuid()) if os.getuid() != 0 else pwd.getpwnam("nobody")
+        username = account.pw_name
+        database.initialize(self.db)
+        database.add_user(self.db, username, "2999-01-01")
+        database.link_protocol(self.db, username, "openssh", username)
+        proc = self.root / "empty-proc"
+        proc.mkdir()
+        with patch.object(sessions.os, "geteuid", return_value=0):
+            rows = sessions.online_ssh_processes(self.db, proc)
+        self.assertEqual([], rows)
+
+    def test_online_view_aggregates_ssh_and_dropbear_under_one_username(self):
+        account = pwd.getpwuid(os.getuid()) if os.getuid() != 0 else pwd.getpwnam("nobody")
+        username = account.pw_name
+        database.initialize(self.db)
+        database.add_user(self.db, username, "2999-01-01")
+        database.link_protocol(self.db, username, "openssh", username)
+        database.link_protocol(self.db, username, "dropbear", username)
+        proc = self.root / "combined-proc"
+        for pid, command in (("201", "sshd"), ("202", "sshd"), ("203", "dropbear")):
+            proc_pid = proc / pid
+            proc_pid.mkdir(parents=True)
+            (proc_pid / "comm").write_text(command + "\n", encoding="utf-8")
+            (proc_pid / "status").write_text(
+                f"Name:\t{command}\nUid:\t{account.pw_uid}\t{account.pw_uid}\t"
+                f"{account.pw_uid}\t{account.pw_uid}\n", encoding="utf-8")
+        with patch.object(sessions.os, "geteuid", return_value=0):
+            rows = sessions.online_ssh_processes(self.db, proc)
+        self.assertEqual(1, len(rows))
+        self.assertEqual(username, rows[0]["username"])
+        self.assertEqual("dropbear/openssh", rows[0]["protocol"])
+        self.assertEqual(3, rows[0]["observed_processes"])
+
     def test_xray_credentials_are_created_once_and_rotated_explicitly(self):
         database.initialize(self.db)
         database.add_user(self.db, "alice", "2999-01-01")

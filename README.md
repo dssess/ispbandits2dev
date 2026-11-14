@@ -118,6 +118,8 @@ sudo neverbandits expire
 sudo neverbandits verify
 ```
 
+The menu dashboard shows host CPU, RAM, storage, uptime, and network totals. When `vnstat` is available, daily and monthly host-interface totals are shown in the Nginxbandit style; these are host-wide traffic estimates, not per-user usage or quota measurements. Full fresh installs include vnStat. Option 17 (`CHECK BANDWIDTH`) uses the same daily/monthly view, falling back to kernel interface counters since boot or counter reset if vnStat is unavailable. The Traffic & Quota screen lists only usernames with an observed SSH/Dropbear daemon process. Its process count is approximate and must not be treated as a unique device count. Live session checks are on demand; Neverbandits does not add a monitoring daemon.
+
 Account creation provisions a no-home `/bin/false` Linux SSH account and selected Xray identities. Before creating an SSH account it checks effective `PasswordAuthentication`, TCP forwarding, authentication-method, and daemon state; it never edits sshd configuration. Disable/expiry locks the Linux password, terminates managed SSH sessions, and removes the account's Xray identities from active configuration. Renewal does not silently clear disabled, expired, or quota states. Permanent deletion requires `account-delete USER --yes` and removes usage history, so back up first.
 
 The default collector records Xray VLESS/Trojan usage every minute. SSH network-byte metering is a separate opt-in experimental install option. It counts per-session IP-layer bytes (not pure payload), can miss authentication-period traffic, and may overshoot between samples. Do not use it for billing or strict production caps until validated on each exact OS/kernel/OpenSSH configuration.

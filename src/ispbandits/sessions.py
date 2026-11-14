@@ -23,7 +23,8 @@ def online_ssh_processes(database: Path | str, proc_root: Path | str = "/proc") 
         raise PermissionError("Online SSH monitoring requires root to inspect all process owners")
 
     today = dt.date.today().isoformat()
-    conn = sqlite3.connect(str(database), timeout=10)
+    database_path = Path(database).resolve()
+    conn = sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True, timeout=2)
     try:
         records = conn.execute("""SELECT p.protocol, p.external_identity
             FROM protocol_accounts p
@@ -66,7 +67,22 @@ def online_ssh_processes(database: Path | str, proc_root: Path | str = "/proc") 
             # Process may exit or change while procfs is being sampled.
             continue
 
-    result: list[dict[str, object]] = []
+    active_users: dict[str, dict[str, object]] = {}
     for (protocol, username), count in sorted(configured.items(), key=lambda item: (item[0][1], item[0][0])):
-        result.append({"username": username, "protocol": protocol, "observed_processes": count})
+        if count:
+            row = active_users.setdefault(
+                username,
+                {"username": username, "protocols": set(), "observed_processes": 0},
+            )
+            protocols = row["protocols"]
+            assert isinstance(protocols, set)
+            protocols.add(protocol)
+            row["observed_processes"] = int(row["observed_processes"]) + count
+    result: list[dict[str, object]] = []
+    for username in sorted(active_users):
+        row = active_users[username]
+        protocols = row.pop("protocols")
+        assert isinstance(protocols, set)
+        row["protocol"] = "/".join(sorted(str(protocol) for protocol in protocols))
+        result.append(row)
     return result

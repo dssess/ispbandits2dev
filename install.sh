@@ -339,6 +339,7 @@ if [[ "$FULL" == 1 ]]; then
   FULL_INSTALL_PACKAGES=()
   command -v curl >/dev/null 2>&1 || FULL_INSTALL_PACKAGES+=(curl)
   command -v unzip >/dev/null 2>&1 || FULL_INSTALL_PACKAGES+=(unzip)
+  command -v vnstat >/dev/null 2>&1 || FULL_INSTALL_PACKAGES+=(vnstat)
   command -v sshd >/dev/null 2>&1 || fail "Full Neverbandits requires the VPS's existing OpenSSH server; it will not install or reconfigure sshd."
   for unit in ssh.service sshd.service ssh.socket; do
     if systemctl is-active --quiet "$unit"; then SSHD_ACTIVE=1; break; fi
@@ -446,6 +447,13 @@ PY
     command -v apt-get >/dev/null 2>&1 || fail "Missing required packages (${FULL_INSTALL_PACKAGES[*]}) and apt-get is unavailable."
     DEBIAN_FRONTEND=noninteractive apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${FULL_INSTALL_PACKAGES[@]}"
+  fi
+  if command -v vnstat >/dev/null 2>&1 &&
+     systemctl list-unit-files vnstat.service --no-legend 2>/dev/null | grep -q '^vnstat.service'; then
+    systemctl enable --now vnstat.service ||
+      echo "[WARN] vnStat could not be started; daily/monthly bandwidth totals will remain unavailable until its service is repaired."
+  else
+    echo "[WARN] vnStat service is unavailable; bandwidth display will use since-boot host counters where possible."
   fi
 fi
 
