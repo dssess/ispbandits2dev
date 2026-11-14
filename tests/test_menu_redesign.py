@@ -14,9 +14,12 @@ class MenuRedesignRegistryTests(unittest.TestCase):
     def test_registry_covers_all_legacy_actions_and_sections(self):
         self.assertEqual(set(menu_actions.ACTIONS), set(range(1, 19)))
         self.assertEqual(menu_actions.EXIT_KEYS, {"0", "00", "q", "Q", "x", "X"})
-        self.assertEqual(set(menu_actions.MAIN_SECTIONS), set("CPTOSBDIL"))
+        self.assertEqual(menu_actions.MAIN_SECTIONS, ("L",))
+        self.assertEqual(set(menu_actions.MORE_SECTIONS), set("CPTOSBDI"))
         for section in menu_actions.MAIN_SECTIONS:
             self.assertIn(section, menu_actions.SUBMENU_KEYS)
+        self.assertEqual(set(menu_actions.SUBMENU_KEYS["L"]), set("CPTOSBDI") | {"1"})
+        self.assertEqual(set(menu_actions.SUBMENU_KEYS["M"]), {str(action_id) for action_id in range(1, 19)})
 
     def test_reference_menu_preserves_original_keys_and_never_dispatches_unsupported_features(self):
         self.assertEqual(
@@ -367,7 +370,7 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
             return True
 
     def test_back_exit_and_local_section_dispatch(self):
-        answers = iter(("P", "2", "", "B", "0"))
+        answers = iter(("P", "", "L", "P", "2", "", "B", "0", "0"))
         with tempfile.TemporaryDirectory() as directory, \
              patch("ispbandits.menu.sys.stdin", self._TTY()), \
              patch("builtins.input", side_effect=lambda *_args: next(answers)), \
@@ -378,8 +381,8 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(invoke.call_args.args[1:], ("vless-create",))
 
-    def test_legacy_action_10_remains_available_from_the_l_submenu(self):
-        answers = iter(("L", "10", "alice", "25", "", "0"))
+    def test_legacy_action_10_remains_available_inside_more_actions(self):
+        answers = iter(("L", "1", "10", "alice", "25", "", "B", "0", "0"))
         with tempfile.TemporaryDirectory() as directory, \
              patch("ispbandits.menu.sys.stdin", self._TTY()), \
              patch("builtins.input", side_effect=lambda *_args: next(answers)), \
@@ -389,6 +392,19 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
             result = menu.run_menu(Path(directory) / "db.sqlite")
         self.assertEqual(result, 0)
         self.assertEqual(invoke.call_args.args[1:], ("quota-set", "alice", "--limit-gb", "25"))
+
+    def test_more_actions_hub_contains_letters_and_legacy_menu(self):
+        output = io.StringIO()
+        with patch("ispbandits.menu_ui._dimensions", return_value=(80, 30)), \
+             patch.dict("os.environ", {"TERM": "xterm", "NO_COLOR": "1"}), \
+             redirect_stdout(output):
+            menu_ui.show_more_actions(menu._more_action_items())
+        rendered = output.getvalue()
+        for expected in ("[C] CLIENT MANAGEMENT", "[P] PROTOCOL MANAGEMENT",
+                         "[T] TRAFFIC & QUOTA", "[D] DIAGNOSTICS",
+                         "[1] LEGACY ISPBandits ACTIONS 1–18", "[R] Refresh dashboard",
+                         "[0] Back to Control Centre"):
+            self.assertIn(expected, rendered)
 
     def test_narrow_terminal_uses_wrapped_plain_fallback(self):
         output = io.StringIO()
@@ -426,8 +442,6 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
             "overview": [
                 "OS Linux        : Ubuntu 24.04 LTS",
                 "CPU Name        : Test CPU",
-                "Daily Bandwidth : not collected by this dashboard",
-                "Total Bandwidth : 0.123 GB stored account counters",
             ],
             "health": [
                 ("SSH unit", "active"), ("NGINX unit", "active"),
@@ -454,11 +468,14 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
         self.assertIn("[2]", rendered)
         self.assertIn("[3]", rendered)
         self.assertIn("[1]", rendered)
-        self.assertIn("[02] VMESS", rendered)
-        self.assertIn("[N/A]", rendered)
-        self.assertIn("Daily Bandwidth : not collected", rendered)
+        self.assertNotIn("[02] VMESS", rendered)
+        self.assertNotIn("[N/A]", rendered)
+        self.assertNotIn("[55] XRAY-CORE MENU", rendered)
+        self.assertNotIn("[77] SWAPRAM MENU", rendered)
+        self.assertNotIn("Daily Bandwidth", rendered)
         self.assertIn("TROJAN : OFF", rendered)
-        self.assertIn("EXTERNAL CLIENT CONNECTIVITY: NOT TESTED", rendered)
+        self.assertNotIn("EXTERNAL CLIENT CONNECTIVITY: NOT TESTED", rendered)
+        self.assertIn("[L] More actions", rendered)
         self.assertIn("Version :", rendered)
         self.assertIn("Select menu :", rendered)
         self.assertLessEqual(max(map(len, rendered.splitlines())), 80)

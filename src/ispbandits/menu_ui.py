@@ -144,10 +144,8 @@ def _status_rows(health: Iterable[tuple[str, str]], columns: int) -> list[str]:
         ("NGINX", "nginx unit", False),
         ("XRAY", "xray unit", False),
         ("TROJAN", "trojan port", True),
-        ("DROPBEAR", "dropbear unit", False),
         ("SSH-WS", "ssh-ws unit", False),
         ("VLESS", "vless port", True),
-        ("STUNNEL", "stunnel unit", False),
         ("DATABASE", "database", False),
     )
     tokens: list[str] = []
@@ -240,35 +238,24 @@ def show_dashboard(snapshot: dict[str, object], section_items: Iterable[tuple[st
             key = str(getattr(item, "key", ""))
             label = str(getattr(item, "label", ""))
             available = bool(getattr(item, "available", False))
+            if not available or not bool(getattr(item, "dashboard", True)):
+                continue
             shown_key = key.zfill(2) if key.isdigit() and len(key) < 2 else key
             suffix = ""
             if key in count_keys:
                 counts = protocol_counts if isinstance(protocol_counts, dict) else {}
                 count = counts.get(count_keys[key])
                 suffix = f"[{count}]" if count is not None else "[?]"
-            unavailable = " [N/A]" if not available else ""
-            row = f"     [{shown_key}] {label:<13} {suffix}{unavailable}".rstrip()
-            action_rows.append((row, "cyan" if available else "yellow"))
+            row = f"     [{shown_key}] {label:<13} {suffix}".rstrip()
+            action_rows.append((row, "cyan"))
     else:
         action_rows.extend((str(action), "cyan") for action in quick_actions)
-    action_rows.extend((
-        ("     [x ] EXIT", "cyan"),
-        ("N/A = unavailable in this release; selecting it runs no operation.", "yellow"),
-    ))
+    action_rows.append(("     [x ] EXIT", "cyan"))
     _options_panel(action_rows)
 
-    navigation = ["[L] Legacy ISPBandits actions 1–18   [R] Refresh   [0/X] Exit"]
-    section_labels = {"C": "Clients", "P": "Protocols", "T": "Traffic", "O": "Ops",
-                      "S": "Security", "B": "Backup", "D": "Diagnostics", "I": "Info", "L": "Legacy"}
-    visible_sections = " ".join(f"[{key}] {section_labels.get(key, title)}" for key, title in section_items)
-    if visible_sections:
-        navigation.append("Sections: " + visible_sections)
-    for row in navigation:
-        for line in _wrap(row, columns):
+    if any(key == "L" for key, _ in section_items):
+        for line in _wrap("[L] More actions", columns):
             print(paint(line, "cyan"))
-
-    for line in _wrap("EXTERNAL CLIENT CONNECTIVITY: NOT TESTED", columns):
-        print(paint(line, "yellow"))
     _version_footer(columns)
     print(paint("Select menu : ", "cyan"), end="", flush=True)
 
@@ -281,8 +268,17 @@ def show_section(key: str, title: str, description: str,
         if hint:
             rows.append(f"    {hint}")
     rows.extend(extra)
-    rows.extend(("", "[B] Back to Control Centre     [0/Q] Exit"))
+    rows.extend(("", "[B] Back to More Actions     [0/Q] Exit"))
     panel(f"NEVERBANDITS / {title}", rows)
+    print(paint("Select menu : ", "cyan"), end="", flush=True)
+
+
+def show_more_actions(actions: Iterable[tuple[str, str, str]]) -> None:
+    rows: list[str | tuple[str, str]] = []
+    for choice, label, _hint in actions:
+        rows.append((f"[{choice}] {label}", "cyan"))
+    rows.extend(("", "[R] Refresh dashboard", "[0] Back to Control Centre   [Q/X] Exit"))
+    panel("NEVERBANDITS / MORE ACTIONS", rows)
     print(paint("Select menu : ", "cyan"), end="", flush=True)
 
 

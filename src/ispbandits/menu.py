@@ -382,9 +382,7 @@ def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
         f"Total RAM       : {_memory()} ({_memory_percent()})",
         f"System Uptime   : {_uptime_readable()}",
         f"Current Domain  : {_domain()}",
-        f"IP-VPS          : {_public_interface_ip()} (local interface)",
-        "Daily Bandwidth : not collected by this dashboard",
-        f"Total Bandwidth : {measured}",
+        f"IP-VPS          : {_public_interface_ip()}",
     ]
     account_rows = [
         f"TOTAL ACCOUNTS     {total}",
@@ -714,6 +712,17 @@ def _dispatch_section_action(db_path: Path, section: str, choice: str) -> tuple[
     return _execute_action(db_path, target) if isinstance(target, int) else None
 
 
+def _more_action_items() -> list[tuple[str, str, str]]:
+    items = [
+        (key, str(menu_actions.SECTIONS[key]["title"]),
+         str(menu_actions.SECTIONS[key]["description"]))
+        for key in menu_actions.MORE_SECTIONS
+    ]
+    items.append(("1", "LEGACY ISPBandits ACTIONS 1–18",
+                  "All previous numbered account, traffic, backup, and recovery actions"))
+    return items
+
+
 def run_menu(db_path: Path) -> int:
     """Run the interactive NEXUS Control Centre; CLI commands remain the engine."""
     if not sys.stdin.isatty():
@@ -730,8 +739,6 @@ def run_menu(db_path: Path) -> int:
                 if choice in menu_actions.EXIT_KEYS:
                     print("Goodbye.")
                     return 0
-                if choice in menu_actions.REFRESH_KEYS:
-                    continue
                 normalized = choice.upper()
                 if normalized in menu_actions.MAIN_SECTIONS:
                     section = normalized
@@ -742,7 +749,31 @@ def run_menu(db_path: Path) -> int:
                     show_result(result, message)
                     _pause()
                     continue
-                show_result("FAILED", "Unknown selection. Choose a displayed option, section key, L, R, or X.")
+                show_result("FAILED", "Unknown selection. Choose a displayed number, L for More Actions, or X to exit.")
+                _pause()
+                continue
+
+            if section == "L":
+                menu_ui.show_more_actions(_more_action_items())
+                choice = input().strip()
+                if choice in {"0", "00"}:
+                    section = None
+                    continue
+                if choice.upper() in {"Q", "X"}:
+                    print("Goodbye.")
+                    return 0
+                if choice.upper() == "R":
+                    section = None
+                    continue
+                lookup = choice.upper() if choice.isalpha() else choice
+                target = menu_actions.SUBMENU_KEYS["L"].get(lookup)
+                if target == "M":
+                    section = "M"
+                    continue
+                if isinstance(target, str) and target in menu_actions.MORE_SECTIONS:
+                    section = target
+                    continue
+                show_result("FAILED", "Unknown selection. Choose a displayed section, 1 for legacy actions, R, 0, or X.")
                 _pause()
                 continue
 
@@ -753,16 +784,14 @@ def run_menu(db_path: Path) -> int:
             menu_ui.show_section(section, title, description, _section_actions(section), extra=extra)
             choice = input().strip()
             if choice in menu_actions.BACK_KEYS:
-                section = None
+                section = "L"
                 continue
             if choice in menu_actions.EXIT_KEYS:
                 print("Goodbye.")
                 return 0
-            if choice in menu_actions.REFRESH_KEYS:
-                continue
             result = _dispatch_section_action(db_path, section, choice)
             if result is None:
-                show_result("FAILED", "Unknown selection. Use a displayed action, B to go back, or 0 to exit.")
+                show_result("FAILED", "Unknown selection. Use a displayed action, B to return to More Actions, or 0 to exit.")
             else:
                 show_result(*result)
             _pause()

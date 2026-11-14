@@ -59,14 +59,21 @@ class MenuTests(unittest.TestCase):
         self.assertIn("┌", screen)
         self.assertIn("Server Informations", screen)
         self.assertIn("SSH-WS : ON", screen)
-        self.assertIn("Daily Bandwidth : not collected", screen)
+        self.assertNotIn("Daily Bandwidth", screen)
+        self.assertNotIn("Total Bandwidth", screen)
         self.assertIn("[01] SSHWS", screen)
-        self.assertIn("[02] VMESS", screen)
+        self.assertNotIn("[02] VMESS", screen)
         self.assertIn("[03] VLESS", screen)
         self.assertIn("[04] TROJAN", screen)
-        self.assertIn("[18] LIMIT SPEED", screen)
-        self.assertIn("[N/A]", screen)
-        self.assertIn("[L] Legacy ISPBandits actions 1–18", screen)
+        self.assertNotIn("[18] LIMIT SPEED", screen)
+        self.assertNotIn("[N/A]", screen)
+        self.assertIn("[L] More actions", screen)
+        for shortcut in ("[C] Clients", "[P] Protocols", "[T] Traffic", "[O] Ops",
+                         "[S] Security", "[B] Backup", "[D] Diagnostics", "[I] Info",
+                         "[R] Refresh"):
+            self.assertNotIn(shortcut, screen)
+        self.assertNotIn("[55] XRAY-CORE MENU", screen)
+        self.assertNotIn("[77] SWAPRAM MENU", screen)
         self.assertIn("Version :", screen)
         self.assertIn("Select menu :", screen)
 

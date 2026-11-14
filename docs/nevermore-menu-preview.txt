@@ -1,64 +1,56 @@
 LOCAL MOCK CAPTURE — placeholder data only; not a live VPS screen.
 
+===== MAIN DASHBOARD =====
 ┌──────────────────────────────────────────────────────────┐
 │                   Server Informations                    │
 ├──────────────────────────────────────────────────────────┤
-│ OS Linux        : [PLACEHOLDER OS]                       │
-│ Kernel          : [PLACEHOLDER KERNEL]                   │
-│ CPU Name        : [PLACEHOLDER CPU]                      │
-│ CPU Info        : [PLACEHOLDER CORES / LOAD]             │
-│ Total RAM       : [PLACEHOLDER MEMORY]                   │
-│ System Uptime   : [PLACEHOLDER UPTIME]                   │
-│ Current Domain  : example.invalid (placeholder)          │
-│ IP-VPS          : [PLACEHOLDER IP]                       │
-│ Daily Bandwidth : not collected by this dashboard        │
-│ Total Bandwidth : [PLACEHOLDER STORED COUNTERS]          │
+│ OS Linux        : Ubuntu 22.04 LTS                       │
+│ Kernel          : 5.15.0-generic                         │
+│ CPU Name        : Example 2-Core CPU                     │
+│ CPU Info        : 2 Cores @ 1995 MHz (load 0.35)         │
+│ Total RAM       : 237 / 3911 MiB (6%)                    │
+│ System Uptime   : 2 hours, 40 minutes                    │
+│ Current Domain  : vpn.example.net                        │
+│ IP-VPS          : 203.0.113.10                           │
 └──────────────────────────────────────────────────────────┘
-
-  SSH : UNKNOWN   NGINX : UNKNOWN   XRAY : UNKNOWN   TROJAN : UNKNOWN
-  DROPBEAR : N/A   SSH-WS : UNKNOWN   VLESS : UNKNOWN   STUNNEL : N/A
-  DATABASE : UNKNOWN
-
+  SSH : ON   NGINX : ON   XRAY : ON   TROJAN : LISTENING   SSH-WS : ON
+  VLESS : LISTENING   DATABASE : OK
 ┌──────────────────────────────────────────────────────────┐
-│      [01] SSHWS         [?]                              │
-│      [02] VMESS          [N/A]                           │
-│      [03] VLESS         [?]                              │
-│      [04] TROJAN        [?]                              │
-│      [05] SHADOWSOCKS    [N/A]                           │
-│      [06] EXP FILES      [N/A]                           │
-│      [07] AUTO REBOOT    [N/A]                           │
+│      [01] SSHWS         [1]                              │
+│      [03] VLESS         [0]                              │
+│      [04] TROJAN        [0]                              │
 │      [08] REBOOT                                         │
 │      [09] RESTART                                        │
-│      [11] ADD HOST/DOMAIN  [N/A]                         │
 │      [12] RENEW CERT                                     │
-│      [13] EDIT BANNER    [N/A]                           │
 │      [14] RUNNING STATUS                                 │
 │      [15] USER BANDWIDTH                                 │
-│      [16] SPEEDTEST      [N/A]                           │
 │      [17] CHECK BANDWIDTH                                │
-│      [18] LIMIT SPEED    [N/A]                           │
-│      [19] WEBMIN         [N/A]                           │
-│      [20] INFO SCRIPT                                    │
-│      [21] CLEAR LOG      [N/A]                           │
 │      [22] TASK MANAGER                                   │
-│      [23] DNS CHANGER    [N/A]                           │
-│      [24] NETFLIX CHECKER  [N/A]                         │
-│      [25] TENDANG        [N/A]                           │
-│      [55] XRAY-CORE MENU                                 │
-│      [66] INSTALL BBRPLUS  [N/A]                         │
-│      [77] SWAPRAM MENU                                   │
 │      [88] BACKUP                                         │
 │      [99] RESTORE                                        │
 │      [x ] EXIT                                           │
-│ N/A = unavailable in this release; selecting it runs no  │
-│ operation.                                               │
 └──────────────────────────────────────────────────────────┘
-
-[L] Legacy ISPBandits actions 1–18   [R] Refresh   [0/X] Exit
-Sections: [C] Clients [P] Protocols [T] Traffic [O] Ops [S] Security [B] Backup
-[D] Diagnostics [I] Info [L] Legacy
-EXTERNAL CLIENT CONNECTIVITY: NOT TESTED
+[L] More actions
 ┌─────────────────────────────────────┐
 │  Version : 1.0.0-alpha.6            │
 └─────────────────────────────────────┘
+Select menu :
+
+===== OPEN WITH L: MORE ACTIONS =====
+╔══════════════════════════════════════════════════════════╗
+║               NEVERBANDITS / MORE ACTIONS                ║
+╠══════════════════════════════════════════════════════════╣
+║ [C] CLIENT MANAGEMENT                                    ║
+║ [P] PROTOCOL MANAGEMENT                                  ║
+║ [T] TRAFFIC & QUOTA                                      ║
+║ [O] SERVER OPERATIONS                                    ║
+║ [S] SECURITY CENTRE                                      ║
+║ [B] BACKUP & RECOVERY                                    ║
+║ [D] DIAGNOSTICS                                          ║
+║ [I] SETTINGS & INFORMATION                               ║
+║ [1] LEGACY ISPBandits ACTIONS 1–18                       ║
+║                                                          ║
+║ [R] Refresh dashboard                                    ║
+║ [0] Back to Control Centre   [Q/X] Exit                  ║
+╚══════════════════════════════════════════════════════════╝
 Select menu :

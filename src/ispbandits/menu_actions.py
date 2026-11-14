@@ -28,6 +28,7 @@ class ReferenceOption:
     action: int | str | None
     available: bool
     description: str = ""
+    dashboard: bool = True
 
 
 ACTIONS: dict[int, Action] = {
@@ -74,15 +75,15 @@ REFERENCE_MENU: tuple[ReferenceOption, ...] = (
     ReferenceOption("17", "CHECK BANDWIDTH", "bandwidth", True, "Shows host interface counters since boot; not per-user or daily usage"),
     ReferenceOption("18", "LIMIT SPEED", None, False, "Per-user rate limiting is not implemented"),
     ReferenceOption("19", "WEBMIN", None, False, "Webmin is not installed or managed by this release"),
-    ReferenceOption("20", "INFO SCRIPT", "about", True, "Shows ISPBandits publisher, version, and license notice"),
+    ReferenceOption("20", "INFO SCRIPT", "about", True, "Shows ISPBandits publisher, version, and license notice", dashboard=False),
     ReferenceOption("21", "CLEAR LOG", None, False, "Log deletion is not implemented"),
     ReferenceOption("22", "TASK MANAGER", "process-list", True, "Shows a read-only process summary"),
     ReferenceOption("23", "DNS CHANGER", None, False, "Host resolver changes are not implemented"),
     ReferenceOption("24", "NETFLIX CHECKER", None, False, "No regional streaming-connectivity checker is installed"),
     ReferenceOption("25", "TENDANG", None, False, "Per-user session disconnection is not implemented"),
-    ReferenceOption("55", "XRAY-CORE MENU", 6, True, "Opens the service and local-endpoint diagnostics"),
+    ReferenceOption("55", "XRAY-CORE MENU", 6, True, "Opens the service and local-endpoint diagnostics", dashboard=False),
     ReferenceOption("66", "INSTALL BBRPLUS", None, False, "Kernel congestion-control installation is not implemented"),
-    ReferenceOption("77", "SWAPRAM MENU", "server", True, "Shows memory and swap context only; does not modify swap"),
+    ReferenceOption("77", "SWAPRAM MENU", "server", True, "Shows memory and swap context only; does not modify swap", dashboard=False),
     ReferenceOption("88", "BACKUP", 8, True, "Creates a protected SQLite backup"),
     ReferenceOption("99", "RESTORE", 18, True, "Validates archive integrity and requires exact RESTORE confirmation"),
 )
@@ -134,13 +135,19 @@ SECTIONS: dict[str, dict[str, object]] = {
         "actions": (),
     },
     "L": {
-        "title": "ISPBANDITS LEGACY ACTIONS",
+        "title": "MORE ACTIONS",
+        "description": "Management sections and all existing ISPBandits actions",
+        "actions": (),
+    },
+    "M": {
+        "title": "LEGACY ISPBandits ACTIONS",
         "description": "All existing ISPBandits actions 1–18 remain available here",
         "actions": tuple(range(1, 19)),
     },
 }
 
-MAIN_SECTIONS = ("C", "P", "T", "O", "S", "B", "D", "I", "L")
+MAIN_SECTIONS = ("L",)
+MORE_SECTIONS = ("C", "P", "T", "O", "S", "B", "D", "I")
 
 # Local submenu numbering is distinct from the original Nevermore top-level keys.
 SUBMENU_KEYS: dict[str, dict[str, int | str]] = {
@@ -152,7 +159,8 @@ SUBMENU_KEYS: dict[str, dict[str, int | str]] = {
     "B": {str(index + 1): action_id for index, action_id in enumerate(SECTIONS["B"]["actions"])},
     "D": {"1": 6, "2": 9},
     "I": {"1": "about", "2": "version", "3": "server"},
-    "L": {str(action_id): action_id for action_id in ACTIONS},
+    "L": {**{key: key for key in MORE_SECTIONS}, "1": "M"},
+    "M": {str(action_id): action_id for action_id in ACTIONS},
 }
 
 assert set(ACTIONS) == set(range(1, 19))
