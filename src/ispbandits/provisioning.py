@@ -42,7 +42,7 @@ def create_linux_ssh_account(username: str, expiry_date: str,
     The caller must be root. The returned password is shown only by the caller;
     it is never saved in SQLite or logged by this module.
     """
-    database.validate_username(username)
+    database.validate_new_username(username)
     if os.geteuid() != 0:
         raise PermissionError("Creating Linux SSH accounts requires root")
     try:
@@ -70,7 +70,9 @@ def create_linux_ssh_account(username: str, expiry_date: str,
 
     # No home directory and no interactive shell. SSH port-forwarding-only
     # clients can still authenticate; the server admin's account is untouched.
-    _run([useradd, "-M", "-s", "/bin/false", "-e", expiry.isoformat(), username])
+    # Ubuntu/Debian's default NAME_REGEX rejects uppercase and digit-leading names.
+    # The application validator restricts this override to 4-32 ASCII alphanumerics.
+    _run([useradd, "--badname", "-M", "-s", "/bin/false", "-e", expiry.isoformat(), username])
     try:
         _run([chpasswd], input_text=f"{username}:{password}\n")
     except Exception:
@@ -169,6 +171,7 @@ def create_managed_account(database_path: Path | str, username: str, expiry_date
                            data_limit: int = 0,
                            ssh_password: str | None = None) -> dict[str, object]:
     """Create one account and selected protocol identities with rollback on error."""
+    database.validate_new_username(username)
     allowed = {"openssh", "vless", "trojan"}
     if not protocols or len(set(protocols)) != len(protocols) or set(protocols) - allowed:
         raise ValueError("Select one or more unique protocols from openssh, vless, trojan")

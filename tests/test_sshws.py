@@ -125,7 +125,7 @@ class SSHWebSocketTests(unittest.TestCase):
     def test_interactive_create_commands_provision_only_the_selected_protocol(self):
         commands = (
             ("sshws-create", "openssh", ("alice", "temporary-password", "14", "0"), "temporary-password"),
-            ("vless-create", "vless", ("bob", "14", "0"), None),
+            ("vless-create", "vless", ("Bobby", "14", "0"), None),
             ("trojan-create", "trojan", ("carol", "14", "0"), None),
         )
         for command, protocol, answers, password in commands:
@@ -203,8 +203,8 @@ class SSHWebSocketTests(unittest.TestCase):
         expiry = (dt.date.today() + dt.timedelta(days=30)).isoformat()
         with patch.object(provisioning, "create_linux_ssh_account", return_value="chosen-secret") as create_linux:
             result = provisioning.create_managed_account(
-                self.db, "bob", expiry, protocols=("openssh",), ssh_password="chosen-secret")
-        create_linux.assert_called_once_with("bob", expiry, "chosen-secret")
+                self.db, "Bobby", expiry, protocols=("openssh",), ssh_password="chosen-secret")
+        create_linux.assert_called_once_with("Bobby", expiry, "chosen-secret")
         self.assertEqual("chosen-secret", result["ssh_password"])
 
     def test_account_creation_refuses_foundation_only_install(self):
@@ -213,7 +213,7 @@ class SSHWebSocketTests(unittest.TestCase):
              patch.object(cli, "_install_info", return_value={"full_xray": "0"}), \
              patch.object(cli.provisioning, "create_managed_account") as create, \
              patch("sys.stderr", new_callable=io.StringIO):
-            result = cli.main(["--db", str(self.db), "account-create", "bob", "--expires", expiry,
+            result = cli.main(["--db", str(self.db), "account-create", "Bobby", "--expires", expiry,
                                "--protocols", "openssh"])
         self.assertEqual(2, result)
         create.assert_not_called()

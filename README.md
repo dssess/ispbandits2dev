@@ -85,6 +85,8 @@ SSH follows Nevermore's prompt order: `Username :`, `Password :`, `Expired (days
 
 VLESS and Trojan each prompt for username, expiry, and the same lifetime quota choice, generate their own credential, and show only that protocol's server settings and import link. The Trojan receipt lists remarks, host/IP, key, expiry, quota, port 443, WebSocket network, `/trojan-ws` path, and one `trojan://` WebSocket link. It does not advertise Trojan-Go, gRPC, or a config-file endpoint; those formats are not implemented by this release. The protocol flows do not create an SSH Linux user or provision the other Xray protocol. A nonzero cap is accepted only while the experimental meter and full quota collector are active with a fresh valid snapshot; otherwise creation fails before provisioning.
 
+New account usernames may contain uppercase letters, lowercase letters, and digits, with a length of 4–32 characters. SSH account creation applies the same rule before calling `useradd`; existing legacy usernames remain manageable.
+
 For a directly opened interactive flow, use one command at a time:
 
 ```bash

@@ -23,6 +23,34 @@ class FoundationTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_new_usernames_allow_ascii_alphanumeric_case_and_require_four_characters(self):
+        for username in ("AbC123", "1234", "user", "Ab12"):
+            with self.subTest(username=username):
+                self.assertEqual(username, database.validate_new_username(username))
+        for username in ("abc", "", "abc_", "has space", "ümlaut", "a" * 33):
+            with self.subTest(username=username), self.assertRaisesRegex(ValueError, "4-32"):
+                database.validate_new_username(username)
+
+    def test_mixed_case_ssh_and_trojan_accounts_are_created_with_preserved_identity(self):
+        database.initialize(self.db)
+        username = "AbC123"
+        with patch.object(provisioning, "create_linux_ssh_account", return_value="temporary-secret"):
+            result = provisioning.create_managed_account(
+                self.db, username, "2999-01-01", protocols=("openssh", "trojan"))
+        self.assertEqual(username, result["username"])
+        self.assertEqual(username, database.get_account(self.db, username)["username"])
+        self.assertEqual("trojan", result["xray_credentials"][0]["protocol"])
+
+    def test_ssh_creation_uses_constrained_useradd_badname_override(self):
+        with patch.object(provisioning.os, "geteuid", return_value=0), \
+             patch.object(provisioning.pwd, "getpwnam", side_effect=KeyError), \
+             patch.object(provisioning.shutil, "which", side_effect=lambda name: f"/usr/sbin/{name}"), \
+             patch.object(provisioning, "_run") as run:
+            provisioning.create_linux_ssh_account("A123", "2999-01-01", "SafePass123")
+        self.assertEqual("useradd", Path(run.call_args_list[0].args[0][0]).name)
+        self.assertEqual("--badname", run.call_args_list[0].args[0][1])
+        self.assertEqual("A123", run.call_args_list[0].args[0][-1])
+
     def test_initialize_new_db_add_user_and_link(self):
         database.initialize(self.db)
         account_id = database.add_user(self.db, "alice", "2027-02-01")
@@ -277,23 +305,23 @@ class FoundationTests(unittest.TestCase):
              patch.object(provisioning, "delete_linux_ssh_account") as delete_ssh, \
              patch.object(database, "create_xray_protocol", side_effect=ValueError("injected failure")):
             with self.assertRaises(ValueError):
-                provisioning.create_managed_account(self.db, "bob", "2999-01-01",
+                provisioning.create_managed_account(self.db, "Bobby", "2999-01-01",
                                                       protocols=("openssh", "vless"))
-        delete_ssh.assert_called_once_with("bob")
-        self.assertEqual([], [row for row in database.list_usage(self.db) if row["username"] == "bob"])
+        delete_ssh.assert_called_once_with("Bobby")
+        self.assertEqual([], [row for row in database.list_usage(self.db) if row["username"] == "Bobby"])
 
     def test_expiry_marks_only_due_active_users_and_is_idempotent(self):
         database.initialize(self.db)
         database.add_user(self.db, "alice", "2026-11-12")
         database.link_protocol(self.db, "alice", "openssh", "alice")
         database.link_protocol(self.db, "alice", "vless", "alice-vless@example.invalid")
-        database.add_user(self.db, "bob", "2026-11-14")
+        database.add_user(self.db, "Bobby", "2026-11-14")
         today = dt.date(2026, 11, 13)
         self.assertEqual(["alice"], database.expire_users(self.db, today))
         self.assertEqual([], database.expire_users(self.db, today))
         statuses = {row["username"]: row["status"] for row in database.list_usage(self.db)}
         self.assertEqual("EXPIRED", statuses["alice"])
-        self.assertEqual("ACTIVE", statuses["bob"])
+        self.assertEqual("ACTIVE", statuses["Bobby"])
         self.assertEqual([], database.list_enabled_protocols(self.db, "alice"))
 
 

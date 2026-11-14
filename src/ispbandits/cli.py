@@ -676,7 +676,7 @@ def _create_managed_account(path: Path, username: str, expiry: str, limit_gb: in
                             prompt_password: bool = False) -> None:
     if os.geteuid() != 0:
         raise PermissionError("Creating managed system accounts requires root")
-    database.validate_username(username)
+    database.validate_new_username(username)
     if limit_gb < 0:
         raise ValueError("--limit-gb must be zero or greater")
     if limit_gb and not _ssh_meter_ready(path):
@@ -765,7 +765,7 @@ def _interactive_protocol_create(path: Path, protocol: str) -> None:
     try:
         print(f"Create {labels[protocol]} account")
         username = input("Username : ").strip()
-        database.validate_username(username)
+        database.validate_new_username(username)
         password = None
         if protocol == "openssh":
             password = input("Password : ")

@@ -16,7 +16,8 @@ from typing import Iterator
 import uuid as uuidlib
 
 DEFAULT_DB = Path(os.environ.get("ISPB_DB", "/var/lib/ispbandits-dev/database.db"))
-USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,31}$")
+NEW_USERNAME_RE = re.compile(r"^[A-Za-z0-9]{4,32}$")
 PROTOCOLS = {"openssh", "dropbear", "vless", "trojan", "vmess"}
 
 
@@ -147,14 +148,21 @@ def initialize(path: Path | str = DEFAULT_DB) -> None:
 
 def validate_username(username: str) -> str:
     if not USERNAME_RE.fullmatch(username):
-        raise ValueError("Username must match [a-z_][a-z0-9_-]{0,31}")
+        raise ValueError("Username must be 1-32 letters, numbers, underscores, or hyphens")
+    return username
+
+
+def validate_new_username(username: str) -> str:
+    """Validate a newly provisioned login: 4-32 ASCII alphanumeric characters."""
+    if not NEW_USERNAME_RE.fullmatch(username):
+        raise ValueError("New usernames must contain 4-32 letters or numbers only")
     return username
 
 
 def add_user(path: Path | str, username: str, expiry_date: str,
              max_logins: int = 2, data_limit: int = 0,
              ssh_protocols: tuple[str, ...] = ()) -> int:
-    validate_username(username)
+    validate_new_username(username)
     try:
         expiry = dt.date.fromisoformat(expiry_date)
     except ValueError as exc:
