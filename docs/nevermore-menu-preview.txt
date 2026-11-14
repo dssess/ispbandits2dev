@@ -1,4 +1,4 @@
-LOCAL MOCK CAPTURE — placeholder data only; not a live VPS screen.
+LOCAL MOCK CAPTURE — all server, service, account, and usage values below are placeholders; not a live VPS screen.
 
 ===== MAIN DASHBOARD =====
 ┌──────────────────────────────────────────────────────────┐
@@ -8,26 +8,31 @@ LOCAL MOCK CAPTURE — placeholder data only; not a live VPS screen.
 │ Kernel          : 5.15.0-generic                         │
 │ CPU Name        : Example 2-Core CPU                     │
 │ CPU Info        : 2 Cores @ 1995 MHz (load 0.35)         │
+│ CPU Usage       : 6.0%                                   │
 │ Total RAM       : 237 / 3911 MiB (6%)                    │
 │ System Uptime   : 2 hours, 40 minutes                    │
 │ Current Domain  : vpn.example.net                        │
 │ IP-VPS          : 203.0.113.10                           │
+│ Storage         : 18% used (18 / 100 GiB)                │
+│ Data Used Today : 10.33 MiB                              │
+│ Data Used Month : 10.33 MiB                              │
+│ Online SSH      : 1 active username, 2 device estimates  │
 └──────────────────────────────────────────────────────────┘
   SSH : ON   NGINX : ON   XRAY : ON   TROJAN : LISTENING   SSH-WS : ON
   VLESS : LISTENING   DATABASE : OK
 ┌──────────────────────────────────────────────────────────┐
 │      [01] SSHWS         [1]                              │
-│      [03] VLESS         [0]                              │
-│      [04] TROJAN        [0]                              │
-│      [08] REBOOT                                         │
-│      [09] RESTART                                        │
-│      [12] RENEW CERT                                     │
-│      [14] RUNNING STATUS                                 │
-│      [15] USER BANDWIDTH                                 │
-│      [17] CHECK BANDWIDTH                                │
-│      [22] TASK MANAGER                                   │
-│      [88] BACKUP                                         │
-│      [99] RESTORE                                        │
+│      [02] VLESS         [0]                              │
+│      [03] TROJAN        [0]                              │
+│      [04] REBOOT                                         │
+│      [05] RESTART                                        │
+│      [06] RENEW CERT                                     │
+│      [07] RUNNING STATUS                                 │
+│      [08] USER BANDWIDTH                                 │
+│      [09] CHECK BANDWIDTH                                │
+│      [10] TASK MANAGER                                   │
+│      [11] BACKUP                                         │
+│      [12] RESTORE                                        │
 │      [x ] EXIT                                           │
 └──────────────────────────────────────────────────────────┘
 [L] More actions
@@ -35,6 +40,8 @@ LOCAL MOCK CAPTURE — placeholder data only; not a live VPS screen.
 │  Version : 1.0.0-alpha.6            │
 └─────────────────────────────────────┘
 Select menu :
+
+REBOOT and RESTART accept y/yes confirmation. SSH password input is visible.
 
 ===== OPEN WITH L: MORE ACTIONS =====
 ╔══════════════════════════════════════════════════════════╗
@@ -52,5 +59,17 @@ Select menu :
 ║                                                          ║
 ║ [R] Refresh dashboard                                    ║
 ║ [0] Back to Control Centre   [Q/X] Exit                  ║
+╚══════════════════════════════════════════════════════════╝
+Select menu :
+
+===== PROTOCOL MANAGEMENT =====
+╔══════════════════════════════════════════════════════════╗
+║            NEVERBANDITS / PROTOCOL MANAGEMENT            ║
+╠══════════════════════════════════════════════════════════╣
+║ [1] Create SSH / HTTP Custom account                     ║
+║ [2] Create VLESS account                                 ║
+║ [3] Create Trojan account                                ║
+║                                                          ║
+║ [B] Back to More Actions     [0/Q] Exit                  ║
 ╚══════════════════════════════════════════════════════════╝
 Select menu :

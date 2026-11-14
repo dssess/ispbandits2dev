@@ -2,7 +2,6 @@
 from __future__ import annotations
 import argparse
 import datetime as dt
-import getpass
 import json
 import os
 from pathlib import Path
@@ -44,7 +43,7 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--protocols", nargs="+", choices=("openssh", "vless", "trojan"),
                         default=("openssh",))
     create.add_argument("--prompt-password", action="store_true",
-                        help="prompt twice without echoing for a chosen OpenSSH password")
+                        help="prompt twice for a chosen OpenSSH password")
     sub.add_parser("sshws-create", help="interactively create one HTTP Custom SSH account on port 80 and show its connection sheet")
     sub.add_parser("vless-create", help="interactively create one VLESS account and import link")
     sub.add_parser("trojan-create", help="interactively create one Trojan account and import link")
@@ -701,8 +700,8 @@ def _create_managed_account(path: Path, username: str, expiry: str, limit_gb: in
     if prompt_password:
         if "openssh" not in protocols:
             raise ValueError("--prompt-password requires openssh in --protocols")
-        ssh_password = getpass.getpass("New SSH password: ")
-        confirmation = getpass.getpass("Confirm SSH password: ")
+        ssh_password = input("New SSH password: ")
+        confirmation = input("Confirm SSH password: ")
         if not ssh_password or ssh_password != confirmation:
             raise ValueError("Passwords were empty or did not match; no account was created")
 
@@ -769,7 +768,7 @@ def _interactive_protocol_create(path: Path, protocol: str) -> None:
         database.validate_username(username)
         password = None
         if protocol == "openssh":
-            password = getpass.getpass("Password : ")
+            password = input("Password : ")
             if not password:
                 raise ValueError("Password cannot be empty")
             if any(character in password for character in ":\r\n"):
@@ -883,20 +882,18 @@ def _renew_managed_tls() -> None:
 def _host_bandwidth() -> None:
     snapshot = system_monitor.bandwidth_snapshot()
     if snapshot["source"] == "vnstat":
-        print(f"Host bandwidth estimates for {snapshot['interface']} (vnStat):")
-        print(f"  Today: {snapshot['daily']} (received {snapshot['received']}, sent {snapshot['sent']})")
-        print(f"  Month: {snapshot['monthly']} ({snapshot['month']})")
-        print("Host-interface totals; not per-user traffic or exact account quota usage.")
+        print("Nginxbandit-style host bandwidth estimates (vnStat):")
+        print(f"  Data Used Today : {snapshot['daily']}")
+        print(f"  Data Used Month : {snapshot['monthly']}")
+        print("Host-wide totals; not per-user traffic or exact account quota usage.")
         return
-    if snapshot["source"] == "kernel-since-boot":
-        received = system_monitor.humanize_bytes(int(snapshot["received_bytes"]))
-        sent = system_monitor.humanize_bytes(int(snapshot["sent_bytes"]))
-        print(f"Host interface counters across {snapshot['interface']}:")
-        print(f"  Received since boot/counter reset: {received}")
-        print(f"  Sent since boot/counter reset:     {sent}")
-        print("Daily/monthly totals unavailable (vnStat not reporting); not per-user usage.")
+    if snapshot["source"] == "collecting":
+        print("Nginxbandit-style host bandwidth estimates (vnStat):")
+        print("  Data Used Today : collecting vnStat history")
+        print("  Data Used Month : collecting vnStat history")
+        print("Host-wide totals; not per-user traffic or exact account quota usage.")
         return
-    raise RuntimeError("Host network usage is unavailable: neither vnStat nor kernel interface counters could be read")
+    print("Host bandwidth totals are unavailable: vnStat is not installed.")
 
 
 def _process_list() -> None:
@@ -1101,14 +1098,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{row['username']:<20} {row['status']:<14} up={row['upload_bytes']} down={row['download_bytes']} measured={row['measured_bytes']} legacy={row['legacy_bytes']} quota={quota} expires={row['expiry_date']}")
         elif args.command == "online":
             rows = sessions.online_ssh_processes(path)
-            print("ACTIVE SSH/Dropbear SESSIONS — observed daemon processes (approximate; not unique device counts)")
-            print(f"Sampled at: {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}")
+            print("=== ACTIVE CONNECTIONS ===")
+            print(f"{'USERNAME':<24} | ACTIVE DEVICES")
             if not rows:
-                print("No active SSH/Dropbear processes observed.")
+                print("No active SSH/Dropbear processes were observed.")
             else:
-                print(f"{'USERNAME':<20} {'PROTOCOL':<10} {'OBSERVED PROCESSES':>18}")
                 for row in rows:
-                    print(f"{row['username']:<20} {row['protocol']:<10} {row['observed_processes']:>18}")
+                    print(f"{row['username']:<24} | {row['observed_processes']}")
+            print("Active-device counts are observed SSH/Dropbear processes, not unique device IDs.")
         elif args.command == "expire":
             if os.geteuid() != 0:
                 raise PermissionError("Account expiry maintenance requires root")

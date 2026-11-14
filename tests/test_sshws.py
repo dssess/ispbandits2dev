@@ -124,7 +124,7 @@ class SSHWebSocketTests(unittest.TestCase):
 
     def test_interactive_create_commands_provision_only_the_selected_protocol(self):
         commands = (
-            ("sshws-create", "openssh", ("alice", "14", "0"), "temporary-password"),
+            ("sshws-create", "openssh", ("alice", "temporary-password", "14", "0"), "temporary-password"),
             ("vless-create", "vless", ("bob", "14", "0"), None),
             ("trojan-create", "trojan", ("carol", "14", "0"), None),
         )
@@ -133,7 +133,6 @@ class SSHWebSocketTests(unittest.TestCase):
                 inputs = iter(answers)
                 with patch.object(cli.os, "geteuid", return_value=0), \
                      patch("builtins.input", side_effect=lambda _prompt="": next(inputs)) as prompt_input, \
-                     patch.object(cli.getpass, "getpass", return_value=password) as hidden_prompt, \
                      patch.object(cli, "_create_managed_account") as create, \
                      patch("sys.stdout", new_callable=io.StringIO):
                     result = cli.main(["--db", str(self.db), command])
@@ -144,9 +143,7 @@ class SSHWebSocketTests(unittest.TestCase):
                                                (protocol,), password)
                 expected_prompts = ["Username : "]
                 if protocol == "openssh":
-                    hidden_prompt.assert_called_once_with("Password : ")
-                else:
-                    hidden_prompt.assert_not_called()
+                    expected_prompts.append("Password : ")
                 expected_prompts.append("Expired (days): ")
                 expected_prompts.append("Bandwidth quota (GB, lifetime; 0 = unlimited): ")
                 self.assertEqual(expected_prompts,
@@ -182,7 +179,7 @@ class SSHWebSocketTests(unittest.TestCase):
              patch.object(cli.socket, "create_connection", side_effect=OSError("closed")):
             self.assertFalse(cli._ssh_http_ready())
 
-    def test_account_create_hidden_prompt_passes_password_to_provisioning_only(self):
+    def test_account_create_visible_prompt_passes_password_to_provisioning_only(self):
         expiry = (dt.date.today() + dt.timedelta(days=30)).isoformat()
         fake_result = {"username": "alice", "expiry_date": expiry,
                        "ssh_password": "chosen-secret", "xray_credentials": []}
@@ -195,7 +192,7 @@ class SSHWebSocketTests(unittest.TestCase):
              patch.object(cli.provisioning, "create_managed_account", return_value=fake_result) as create, \
              patch.object(cli, "_xray_service_active", return_value=False), \
              patch.object(cli, "_print_connection_details"), \
-             patch.object(cli.getpass, "getpass", side_effect=["chosen-secret", "chosen-secret"]):
+             patch("builtins.input", side_effect=["chosen-secret", "chosen-secret"]):
             result = cli.main(["--db", str(self.db), "account-create", "alice", "--expires", expiry,
                                "--protocols", "openssh", "--prompt-password"])
         self.assertEqual(0, result)

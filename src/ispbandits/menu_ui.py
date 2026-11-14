@@ -236,7 +236,7 @@ def show_dashboard(snapshot: dict[str, object], section_items: Iterable[tuple[st
 
     protocol_counts = snapshot.get("protocol_counts")
     action_rows: list[tuple[str, str | None]] = []
-    count_keys = {"1": "ssh", "3": "vless", "4": "trojan"}
+    count_keys = {"1": "ssh", "2": "vless", "3": "trojan"}
     options = list(reference_options)
     if options:
         for item in options:
@@ -267,11 +267,9 @@ def show_dashboard(snapshot: dict[str, object], section_items: Iterable[tuple[st
 
 def show_section(key: str, title: str, description: str,
                  actions: Iterable[tuple[str, str, str]], *, extra: Iterable[str | tuple[str, str]] = ()) -> None:
-    rows = [description, ""]
-    for choice, label, hint in actions:
+    rows: list[str | tuple[str, str]] = []
+    for choice, label, _hint in actions:
         rows.append((f"[{choice}] {label}", "cyan"))
-        if hint:
-            rows.append(f"    {hint}")
     rows.extend(extra)
     rows.extend(("", "[B] Back to More Actions     [0/Q] Exit"))
     panel(f"NEVERBANDITS / {title}", rows)
@@ -291,7 +289,6 @@ def show_diagnostics(rows: Iterable[tuple[str, str]]) -> None:
     formatted = [(f"{label:<28} {state}", state_color(state)) for label, state in rows]
     formatted.append("")
     formatted.append(("EXTERNAL CLIENT CONNECTIVITY: NOT TESTED", "yellow"))
-    formatted.append(("not external client authentication", "yellow"))
     formatted.append("[R] Refresh diagnostics     [B] Back")
     panel("NEVERBANDITS / DIAGNOSTICS", formatted)
 

@@ -54,38 +54,23 @@ ACTIONS: dict[int, Action] = {
                confirmation="type RESTORE"),
 }
 
-# Option numbers and concise labels match the owner's Nevermore visual master.
-# None is an explicit unsupported operation; it can only produce an explanation.
+# Dashboard options are implemented actions, numbered consecutively for quick entry.
 REFERENCE_MENU: tuple[ReferenceOption, ...] = (
     ReferenceOption("1", "SSHWS", 1, True, "Create one managed SSH/HTTP Custom account"),
-    ReferenceOption("2", "VMESS", None, False, "VMess is not supported by this release"),
-    ReferenceOption("3", "VLESS", 2, True, "Create one managed VLESS account"),
-    ReferenceOption("4", "TROJAN", 3, True, "Create one managed Trojan account"),
-    ReferenceOption("5", "SHADOWSOCKS", None, False, "Shadowsocks is not supported by this release"),
-    ReferenceOption("6", "EXP FILES", None, False, "Expiry-file operations are not implemented"),
-    ReferenceOption("7", "AUTO REBOOT", None, False, "No reboot scheduler is configured by this release"),
-    ReferenceOption("8", "REBOOT", "reboot", True, "Queues a system reboot after exact confirmation"),
-    ReferenceOption("9", "RESTART", "restart", True, "Restarts only managed Neverbandits services after confirmation"),
-    ReferenceOption("11", "ADD HOST/DOMAIN", None, False, "Domain selection is an install-time operation; live mutation is not implemented"),
-    ReferenceOption("12", "RENEW CERT", "tls-renew", True, "Runs the managed Certbot renewal check and validates the installed certificate"),
-    ReferenceOption("13", "EDIT BANNER", None, False, "SSH banner editing is not implemented"),
-    ReferenceOption("14", "RUNNING STATUS", 6, True, "Shows systemd and local endpoint diagnostics; external client access is not tested"),
-    ReferenceOption("15", "USER BANDWIDTH", 4, True, "Shows stored per-account traffic counters"),
-    ReferenceOption("16", "SPEEDTEST", None, False, "No speed-test backend is installed"),
-    ReferenceOption("17", "CHECK BANDWIDTH", "bandwidth", True, "Shows vnStat host totals for today and this month when available; never per-user quota usage"),
-    ReferenceOption("18", "LIMIT SPEED", None, False, "Per-user rate limiting is not implemented"),
-    ReferenceOption("19", "WEBMIN", None, False, "Webmin is not installed or managed by this release"),
-    ReferenceOption("20", "INFO SCRIPT", "about", True, "Shows ISPBandits publisher, version, and license notice", dashboard=False),
-    ReferenceOption("21", "CLEAR LOG", None, False, "Log deletion is not implemented"),
-    ReferenceOption("22", "TASK MANAGER", "process-list", True, "Shows a read-only process summary"),
-    ReferenceOption("23", "DNS CHANGER", None, False, "Host resolver changes are not implemented"),
-    ReferenceOption("24", "NETFLIX CHECKER", None, False, "No regional streaming-connectivity checker is installed"),
-    ReferenceOption("25", "TENDANG", None, False, "Per-user session disconnection is not implemented"),
-    ReferenceOption("55", "XRAY-CORE MENU", 6, True, "Opens the service and local-endpoint diagnostics", dashboard=False),
-    ReferenceOption("66", "INSTALL BBRPLUS", None, False, "Kernel congestion-control installation is not implemented"),
-    ReferenceOption("77", "SWAPRAM MENU", "server", True, "Shows memory and swap context only; does not modify swap", dashboard=False),
-    ReferenceOption("88", "BACKUP", 8, True, "Creates a protected SQLite backup"),
-    ReferenceOption("99", "RESTORE", 18, True, "Validates archive integrity and requires exact RESTORE confirmation"),
+    ReferenceOption("2", "VLESS", 2, True, "Create one managed VLESS account"),
+    ReferenceOption("3", "TROJAN", 3, True, "Create one managed Trojan account"),
+    ReferenceOption("4", "REBOOT", "reboot", True, "Queues a server reboot after yes/no confirmation"),
+    ReferenceOption("5", "RESTART", "restart", True, "Restarts managed services after yes/no confirmation"),
+    ReferenceOption("6", "RENEW CERT", "tls-renew", True, "Validates the renewed certificate"),
+    ReferenceOption("7", "RUNNING STATUS", 6, True, "Systemd and local endpoint diagnostics"),
+    ReferenceOption("8", "USER BANDWIDTH", 4, True, "Stored per-account traffic totals"),
+    ReferenceOption("9", "CHECK BANDWIDTH", "bandwidth", True, "Host daily and monthly vnStat totals"),
+    ReferenceOption("10", "TASK MANAGER", "process-list", True, "Read-only process summary"),
+    ReferenceOption("11", "BACKUP", 8, True, "Create a protected database backup"),
+    ReferenceOption("12", "RESTORE", 18, True, "Validated database restore"),
+    ReferenceOption("13", "INFO SCRIPT", "about", True, "Publisher and license", dashboard=False),
+    ReferenceOption("14", "XRAY-CORE MENU", 6, True, "Service diagnostics", dashboard=False),
+    ReferenceOption("15", "SERVER INFO", "server", True, "Server information", dashboard=False),
 )
 REFERENCE_MENU_BY_KEY = {item.key: item for item in REFERENCE_MENU}
 

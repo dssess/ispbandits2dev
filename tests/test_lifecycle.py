@@ -107,27 +107,27 @@ class AccountLifecycleTests(unittest.TestCase):
         self.assertEqual(0, result)
         self.assertEqual(existing_vless, database.get_xray_protocol_state(self.db, "alice", "vless")["secret"])
 
-    def test_ssh_creation_uses_hidden_password_prompt_without_echo(self):
+    def test_ssh_creation_uses_visible_password_prompt(self):
         secret = "not-for-terminal-output"
         output = io.StringIO()
+        prompts = []
+        answers = iter(("newuser", secret, "30", "0"))
         with patch.object(cli.os, "geteuid", return_value=0), \
-             patch("builtins.input", side_effect=("newuser", "30", "0")), \
-             patch.object(cli.getpass, "getpass", return_value=secret) as hidden_prompt, \
+             patch("builtins.input", side_effect=lambda prompt="": (prompts.append(prompt), next(answers))[1]), \
              patch.object(cli, "_create_managed_account") as create, \
              patch("sys.stdout", output):
             cli._interactive_protocol_create(self.db, "openssh")
-        hidden_prompt.assert_called_once_with("Password : ")
+        self.assertIn("Password : ", prompts)
         self.assertEqual(secret, create.call_args.args[-1])
-        self.assertNotIn(secret, output.getvalue())
 
     def test_ssh_creation_is_root_gated_before_prompting(self):
         with patch.object(cli.os, "geteuid", return_value=1000), \
              patch("builtins.input") as prompt, \
-             patch.object(cli.getpass, "getpass") as hidden_prompt:
+             patch.object(cli, "_create_managed_account") as create:
             with self.assertRaisesRegex(PermissionError, "requires root"):
                 cli._interactive_protocol_create(self.db, "openssh")
         prompt.assert_not_called()
-        hidden_prompt.assert_not_called()
+        create.assert_not_called()
 
     def test_failed_xray_rotation_restores_old_credential_and_identity(self):
         conn = sqlite3.connect(self.db)

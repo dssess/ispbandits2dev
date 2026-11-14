@@ -29,7 +29,7 @@ class MenuTests(unittest.TestCase):
             self.assertEqual(cli.main([]), 0)
 
     def test_usage_menu_choice_dispatches_cli_action(self):
-        answers = iter(("15", "", "0"))
+        answers = iter(("8", "", "0"))
         with patch("ispbandits.menu.sys.stdin", _FakeTTY()), \
              patch("builtins.input", side_effect=lambda _prompt="": next(answers)), \
              patch("ispbandits.menu._call_cli", return_value=0) as run_action:
@@ -38,7 +38,7 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(run_action.call_args.args[1], "usage")
 
     def test_protocol_creation_options_dispatch_to_separate_commands(self):
-        answers = iter(("1", "", "3", "", "4", "", "0"))
+        answers = iter(("1", "", "2", "", "3", "", "0"))
         with patch("ispbandits.menu.sys.stdin", _FakeTTY()), \
              patch("builtins.input", side_effect=lambda _prompt="": next(answers)), \
              patch("ispbandits.menu.os.geteuid", return_value=0), \
@@ -62,9 +62,11 @@ class MenuTests(unittest.TestCase):
         self.assertNotIn("Daily Bandwidth", screen)
         self.assertNotIn("Total Bandwidth", screen)
         self.assertIn("[01] SSHWS", screen)
-        self.assertNotIn("[02] VMESS", screen)
-        self.assertIn("[03] VLESS", screen)
-        self.assertIn("[04] TROJAN", screen)
+        self.assertIn("[02] VLESS", screen)
+        self.assertIn("[03] TROJAN", screen)
+        self.assertIn("[04] REBOOT", screen)
+        self.assertIn("[05] RESTART", screen)
+        self.assertIn("[06] RENEW CERT", screen)
         self.assertNotIn("[18] LIMIT SPEED", screen)
         self.assertNotIn("[N/A]", screen)
         self.assertIn("[L] More actions", screen)

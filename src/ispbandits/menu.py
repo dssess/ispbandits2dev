@@ -15,7 +15,6 @@ import sqlite3
 import socket
 import subprocess
 import sys
-import time
 
 from . import database, sessions, system_monitor
 from . import menu_actions, menu_ui
@@ -339,30 +338,6 @@ def _cpu_details() -> tuple[str, str]:
     return model, f"{cores} Cores @ {frequency} ({load})"
 
 
-def _cpu_usage_percent(interval: float = 0.1) -> str:
-    """Measure aggregate CPU busy time from procfs over a short bounded interval."""
-    def counters() -> tuple[int, int]:
-        line = Path("/proc/stat").read_text(encoding="ascii").splitlines()[0]
-        values = [int(value) for value in line.split()[1:]]
-        if len(values) < 4:
-            raise ValueError("incomplete CPU counters")
-        total = sum(values)
-        idle = values[3] + (values[4] if len(values) > 4 else 0)
-        return total, idle
-
-    try:
-        first_total, first_idle = counters()
-        time.sleep(max(0.0, min(0.25, interval)))
-        second_total, second_idle = counters()
-        elapsed = second_total - first_total
-        if elapsed <= 0:
-            return "unavailable"
-        busy = max(0, elapsed - (second_idle - first_idle))
-        return f"{max(0, min(100, round(busy * 100 / elapsed)))}% (sample)"
-    except (OSError, ValueError, IndexError, ZeroDivisionError):
-        return "unavailable"
-
-
 def _uptime_readable() -> str:
     try:
         seconds = int(float(Path("/proc/uptime").read_text(encoding="ascii").split()[0]))
@@ -394,6 +369,7 @@ def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
         kernel = "unknown"
     counts = _database_counts(db_path)
     cpu_name, cpu_info = _cpu_details()
+    resources = system_monitor.resource_snapshot()
     bandwidth = system_monitor.bandwidth_snapshot()
     ssh_sessions = _online_ssh_snapshot(db_path)
     total = str(counts.get("total", "unavailable")) if counts else "unavailable"
@@ -406,33 +382,35 @@ def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
         f"Kernel          : {kernel}",
         f"CPU Name        : {cpu_name}",
         f"CPU Info        : {cpu_info}",
-        f"CPU Usage       : {_cpu_usage_percent()}",
-        f"Total RAM       : {_memory()} ({_memory_percent()})",
-        f"System Uptime   : {_uptime_readable()}",
+        f"CPU Usage       : {resources['cpu']}",
+        f"Total RAM       : {resources['memory']} ({resources['memory_percent']})",
+        f"System Uptime   : {resources['uptime']}",
         f"Current Domain  : {_domain()}",
         f"IP-VPS          : {_public_interface_ip()}",
         f"Storage         : {_storage_summary()}",
     ]
     if bandwidth["source"] == "vnstat":
         overview.extend([
-            f"Daily Bandwidth : {bandwidth['daily']} ({bandwidth['interface']}, vnStat)",
-            f"Monthly Bandwidth: {bandwidth['monthly']} ({bandwidth['month']})",
+            f"Data Used Today : {bandwidth['daily']}",
+            f"Data Used Month : {bandwidth['monthly']}",
         ])
-    elif bandwidth["source"] == "kernel-since-boot":
-        overview.append(
-            "Host Traffic    : since boot/reset "
-            f"RX {system_monitor.humanize_bytes(int(bandwidth['received_bytes']))} / "
-            f"TX {system_monitor.humanize_bytes(int(bandwidth['sent_bytes']))}"
-        )
+    elif bandwidth["source"] == "collecting":
+        overview.extend([
+            "Data Used Today : collecting vnStat history",
+            "Data Used Month : collecting vnStat history",
+        ])
     else:
-        overview.append("Host Bandwidth  : unavailable")
+        overview.extend([
+            "Data Used Today : unavailable (vnStat not installed)",
+            "Data Used Month : unavailable (vnStat not installed)",
+        ])
     if ssh_sessions is None:
         overview.append("Online SSH      : unavailable (root process scan required)")
     else:
         process_count = sum(int(row["observed_processes"]) for row in ssh_sessions)
         overview.append(
             f"Online SSH      : {len(ssh_sessions)} active username(s), "
-            f"{process_count} observed process(es) (approximate)"
+            f"{process_count} active-device estimate(s)"
         )
     account_rows = [
         f"TOTAL ACCOUNTS     {total}",
@@ -441,7 +419,7 @@ def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
         (f"EXPIRED / QUOTA    {counts.get('expired', 'unavailable')} / {counts.get('quota', 'unavailable')}"
          if counts else "EXPIRED / QUOTA    unavailable"),
         f"Measured account traffic: {measured}",
-        "ONLINE SSH         Not sampled on dashboard; see Traffic & Quota (approximate process counts)",
+        "ONLINE SSH         Process-count estimate; see Traffic & Quota for active users",
     ]
     service_checks = [
         ("SSH unit", _ssh_unit_state),
@@ -466,7 +444,7 @@ def _online_ssh_snapshot(db_path: Path) -> list[dict[str, object]] | None:
     """Return active managed SSH/Dropbear process rows; None means not inspectable."""
     try:
         return sessions.online_ssh_processes(db_path)
-    except (OSError, sqlite3.Error, PermissionError, ValueError):
+    except (OSError, sqlite3.Error, PermissionError, ValueError, RuntimeError):
         return None
 
 
@@ -672,6 +650,18 @@ def _information_action(db_path: Path, item: str) -> tuple[str, str]:
     return "FAILED", "Unknown information action."
 
 
+def _confirm_yes_no(db_path: Path, prompt: str, *arguments: str) -> tuple[str, str]:
+    if os.geteuid() != 0:
+        return "FAILED", "This operation requires root. Start the menu with: sudo menu"
+    try:
+        confirmation = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "CANCELLED", "Operation cancelled; no changes were made."
+    if confirmation not in {"y", "yes"}:
+        return "CANCELLED", "Confirmation not accepted; operation cancelled."
+    return _invoke_cli(db_path, *arguments)
+
+
 def _confirm_action(db_path: Path, phrase: str, prompt: str, *arguments: str) -> tuple[str, str]:
     if os.geteuid() != 0:
         return "FAILED", "This operation requires root. Start the menu with: sudo menu"
@@ -688,6 +678,8 @@ def _execute_reference_option(db_path: Path, key: str) -> tuple[str, str]:
     option = menu_actions.REFERENCE_MENU_BY_KEY.get(key)
     if option is None:
         return "FAILED", f"Unknown Nevermore menu option: {key}"
+    if not option.dashboard:
+        return "FAILED", f"{option.label} is not a displayed dashboard option."
     if not option.available or option.action is None:
         return "FAILED", f"{option.label} is unavailable: {option.description}. No command was run."
     if isinstance(option.action, int):
@@ -697,12 +689,11 @@ def _execute_reference_option(db_path: Path, key: str) -> tuple[str, str]:
     if option.action == "server":
         return _information_action(db_path, "server")
     if option.action == "reboot":
-        return _confirm_action(
-            db_path, "REBOOT", "This queues a server reboot and disconnects customers. Type REBOOT: ",
-            "reboot", "--confirm", "REBOOT")
+        return _confirm_yes_no(
+            db_path, "Reboot server now? [y/N]: ", "reboot", "--confirm", "REBOOT")
     if option.action == "restart":
-        return _confirm_action(
-            db_path, "RESTART", "This restarts managed services and may interrupt traffic. Type RESTART: ",
+        return _confirm_yes_no(
+            db_path, "Restart managed services now? [y/N]: ",
             "service-restart", "--confirm", "RESTART")
     if option.action == "tls-renew":
         return _confirm_action(
@@ -728,7 +719,7 @@ def _section_actions(section: str) -> list[tuple[str, str, str]]:
 
 def _section_extra(db_path: Path, section: str) -> list[str | tuple[str, str]]:
     if section == "C":
-        return ["Permanent deletion removes the selected account and requires re-entering its username."]
+        return ["Delete permanently; re-enter the username."]
     if section == "T":
         timer_checks = [
             ("Xray collection timer", lambda: _service_state("ispbandits-collect.timer")),
@@ -737,36 +728,36 @@ def _section_extra(db_path: Path, section: str) -> list[str | tuple[str, str]]:
         ]
         timer_states = _collect_checks(timer_checks)
         session_rows = _online_ssh_snapshot(db_path)
-        rows: list[str | tuple[str, str]] = [
-            ("ACTIVE SSH SESSIONS (process-based estimate)", "cyan"),
-        ]
+        rows: list[str | tuple[str, str]] = [("=== ACTIVE CONNECTIONS ===", "cyan")]
+        if session_rows is not None:
+            rows.append(("USERNAME                 | ACTIVE DEVICES", "cyan"))
         if session_rows is None:
-            rows.append(("Live session scan unavailable; run menu as root.", "yellow"))
+            rows.append(("Live session scan unavailable; run as root.", "yellow"))
         elif not session_rows:
-            rows.append(("No active SSH/Dropbear processes observed.", "yellow"))
+            rows.append(("No active SSH/Dropbear processes were observed.", "yellow"))
         else:
-            rows.append(("USERNAME                 PROTOCOL   OBSERVED PROCESSES", "cyan"))
             for item in session_rows:
+                count = int(item["observed_processes"])
+                color = "red" if count >= 3 else "green"
                 rows.append((
-                    f"{str(item['username']):<24} {str(item['protocol']).upper():<10} "
-                    f"{int(item['observed_processes']):>4}",
-                    "green",
+                    f"{str(item['username']):<24} | {count:<15}",
+                    color,
                 ))
         rows.extend([
             (f"{label}: {timer_states.get(label, 'unavailable')}",
              menu_ui.state_color(timer_states.get(label, "unavailable")))
             for label, _ in timer_checks
         ] + [
-            "Process counts are approximate and do not identify unique devices.",
-            "Quota sampling is not a hard real-time byte cap.",
+            "Counts are SSH/Dropbear process estimates, not unique devices.",
+            "Quota usage is sampled, not a hard real-time cap.",
         ])
         return rows
     if section == "O":
         return ["SERVER INFORMATION"] + list(_dashboard_snapshot(db_path)["overview"])
     if section == "S":
-        return ["Password changes affect the selected account.", "Store replacement credentials securely."]
+        return ["Change affects this account only.", "Store the new password securely."]
     if section == "B":
-        return ["Restore replaces the current database.", "Exact RESTORE confirmation is mandatory."]
+        return ["Restore replaces the database; a verified archive and RESTORE confirmation are required."]
     if section == "D":
         return ["SYSTEMD / LOCAL ENDPOINT / DATABASE RESULTS"] + [
             (f"{label:<34} {state.upper()}", menu_ui.state_color(state))
@@ -822,7 +813,8 @@ def run_menu(db_path: Path) -> int:
                     section = normalized
                     continue
                 reference_key = str(int(choice)) if choice.isdigit() else choice
-                if reference_key in menu_actions.REFERENCE_MENU_BY_KEY:
+                option = menu_actions.REFERENCE_MENU_BY_KEY.get(reference_key)
+                if option is not None and option.dashboard:
                     result, message = _execute_reference_option(db_path, reference_key)
                     show_result(result, message)
                     _pause()

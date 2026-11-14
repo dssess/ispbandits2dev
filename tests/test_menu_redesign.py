@@ -21,21 +21,14 @@ class MenuRedesignRegistryTests(unittest.TestCase):
         self.assertEqual(set(menu_actions.SUBMENU_KEYS["L"]), set("CPTOSBDI") | {"1"})
         self.assertEqual(set(menu_actions.SUBMENU_KEYS["M"]), {str(action_id) for action_id in range(1, 19)})
 
-    def test_reference_menu_preserves_original_keys_and_never_dispatches_unsupported_features(self):
-        self.assertEqual(
-            [item.key for item in menu_actions.REFERENCE_MENU],
-            ["1", "2", "3", "4", "5", "6", "7", "8", "9", "11", "12", "13",
-             "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24",
-             "25", "55", "66", "77", "88", "99"],
-        )
-        for option in menu_actions.REFERENCE_MENU:
-            if option.available:
-                continue
-            with self.subTest(option=option.key), patch("ispbandits.menu._invoke_cli") as invoke:
-                result = menu._execute_reference_option(Path("/tmp/db"), option.key)
-            self.assertEqual(result[0], "FAILED")
-            self.assertIn("unavailable", result[1].lower())
-            invoke.assert_not_called()
+    def test_reference_menu_numbers_are_sequential_and_only_registered_actions_are_available(self):
+        self.assertEqual([item.key for item in menu_actions.REFERENCE_MENU],
+                         [str(value) for value in range(1, 16)])
+        self.assertTrue(all(item.available for item in menu_actions.REFERENCE_MENU))
+        visible = [item for item in menu_actions.REFERENCE_MENU if item.dashboard]
+        self.assertEqual([item.key for item in visible], [str(value) for value in range(1, 13)])
+        self.assertEqual([item.key for item in menu_actions.REFERENCE_MENU if not item.dashboard],
+                         ["13", "14", "15"])
 
     def test_all_actions_dispatch_to_existing_commands(self):
         expected = {
@@ -95,13 +88,48 @@ class MenuRedesignRegistryTests(unittest.TestCase):
                 self.assertEqual(invoke.call_args.args[1:], (command,))
 
     def test_reference_create_options_route_to_separate_existing_handlers(self):
-        expected = {"1": "sshws-create", "3": "vless-create", "4": "trojan-create"}
+        expected = {"1": "sshws-create", "2": "vless-create", "3": "trojan-create"}
         for key, command in expected.items():
             with self.subTest(key=key), patch("ispbandits.menu.os.geteuid", return_value=0), \
                  patch("ispbandits.menu._invoke_cli", return_value=("SUCCESS", "ok")) as invoke:
                 result = menu._execute_reference_option(Path("/tmp/db"), key)
             self.assertEqual(result[0], "SUCCESS")
             self.assertEqual(invoke.call_args.args[1:], (command,))
+
+    def test_remaining_visible_quick_actions_route_to_their_handlers(self):
+        action_ids = {"7": 6, "8": 4, "11": 8, "12": 18}
+        for key, action_id in action_ids.items():
+            with self.subTest(key=key), patch("ispbandits.menu.os.geteuid", return_value=0), \
+                 patch("ispbandits.menu._execute_action", return_value=("SUCCESS", "ok")) as dispatch:
+                result = menu._execute_reference_option(Path("/tmp/db"), key)
+            self.assertEqual(result[0], "SUCCESS")
+            dispatch.assert_called_once_with(Path("/tmp/db"), action_id)
+
+        for key, command in (("9", "bandwidth"), ("10", "process-list")):
+            with self.subTest(key=key), patch("ispbandits.menu._invoke_cli", return_value=("SUCCESS", "ok")) as invoke:
+                result = menu._execute_reference_option(Path("/tmp/db"), key)
+            self.assertEqual(result[0], "SUCCESS")
+            self.assertEqual(invoke.call_args.args[1:], (command,))
+
+    def test_tls_quick_action_uses_the_existing_renewal_guard(self):
+        with patch("ispbandits.menu.os.geteuid", return_value=0), \
+             patch("builtins.input", return_value="RENEW"), \
+             patch("ispbandits.menu._invoke_cli", return_value=("SUCCESS", "ok")) as invoke:
+            result = menu._execute_reference_option(Path("/tmp/db"), "6")
+        self.assertEqual(result[0], "SUCCESS")
+        self.assertEqual(invoke.call_args.args[1:], ("tls-renew", "--confirm", "RENEW"))
+
+    def test_hidden_reference_options_never_dispatch(self):
+        for key in ("13", "14", "15"):
+            with self.subTest(key=key), patch("ispbandits.menu._invoke_cli") as invoke, \
+                 patch("ispbandits.menu._information_action") as info, \
+                 patch("ispbandits.menu._execute_action") as action:
+                result = menu._execute_reference_option(Path("/tmp/db"), key)
+            self.assertEqual(result[0], "FAILED")
+            self.assertIn("not a displayed dashboard option", result[1])
+            invoke.assert_not_called()
+            info.assert_not_called()
+            action.assert_not_called()
 
     def test_root_required_actions_are_blocked_before_dispatch(self):
         root_ids = [action_id for action_id, action in menu_actions.ACTIONS.items() if action.requires_root]
@@ -306,8 +334,8 @@ class OriginalMenuOperationalCommandTests(unittest.TestCase):
                   "month": "2026-11"}
         with patch.object(cli.system_monitor, "bandwidth_snapshot", return_value=vnstat), redirect_stdout(output):
             cli._host_bandwidth()
-        self.assertIn("Today: 40.67 GiB", output.getvalue())
-        self.assertIn("Month: 483.79 GiB", output.getvalue())
+        self.assertIn("Data Used Today : 40.67 GiB", output.getvalue())
+        self.assertIn("Data Used Month : 483.79 GiB", output.getvalue())
         self.assertIn("not per-user", output.getvalue())
 
         with patch("ispbandits.cli.subprocess.run", return_value=self.completed([], stdout="PID COMMAND %CPU %MEM\n1 init 0 1\n")), \
@@ -316,14 +344,47 @@ class OriginalMenuOperationalCommandTests(unittest.TestCase):
         self.assertIn("read-only", output.getvalue())
         self.assertIn("1 init", output.getvalue())
 
+    def test_online_cli_uses_nginxbandit_active_device_panel(self):
+        output = io.StringIO()
+        active = [{"username": "alice", "protocol": "openssh", "observed_processes": 3}]
+        with patch("ispbandits.cli.sessions.online_ssh_processes", return_value=active), \
+             redirect_stdout(output):
+            result = cli.main(["--db", "/tmp/neverbandits-test.db", "online"])
+        self.assertEqual(0, result)
+        self.assertIn("=== ACTIVE CONNECTIONS ===", output.getvalue())
+        self.assertIn("USERNAME", output.getvalue())
+        self.assertIn("ACTIVE DEVICES", output.getvalue())
+        self.assertIn("alice", output.getvalue())
+        self.assertIn("| 3", output.getvalue())
+        self.assertNotIn("PROTOCOL", output.getvalue())
+
+        output = io.StringIO()
+        collecting = {"source": "collecting", "daily": "collecting", "monthly": "collecting"}
+        with patch.object(cli.system_monitor, "bandwidth_snapshot", return_value=collecting), \
+             redirect_stdout(output):
+            cli._host_bandwidth()
+        self.assertIn("Data Used Today : collecting vnStat history", output.getvalue())
+        self.assertNotIn("since boot", output.getvalue().lower())
+
     def test_menu_confirmation_mismatch_never_dispatches_operational_command(self):
-        for key, answer in (("8", "no"), ("9", "REBOOT"), ("12", "no")):
+        for key, answer in (("4", "no"), ("5", "REBOOT"), ("6", "no")):
             with self.subTest(key=key), patch("ispbandits.menu.os.geteuid", return_value=0), \
                  patch("builtins.input", return_value=answer), \
                  patch("ispbandits.menu._invoke_cli") as invoke:
                 result = menu._execute_reference_option(Path("/tmp/db"), key)
             self.assertEqual(result[0], "CANCELLED")
             invoke.assert_not_called()
+
+    def test_reboot_and_restart_accept_short_yes_confirmation(self):
+        expected = {"4": ("reboot", "--confirm", "REBOOT"),
+                    "5": ("service-restart", "--confirm", "RESTART")}
+        for key, arguments in expected.items():
+            with self.subTest(key=key), patch("ispbandits.menu.os.geteuid", return_value=0), \
+                 patch("builtins.input", return_value="y"), \
+                 patch("ispbandits.menu._invoke_cli", return_value=("SUCCESS", "ok")) as invoke:
+                result = menu._execute_reference_option(Path("/tmp/db"), key)
+            self.assertEqual(result[0], "SUCCESS")
+            self.assertEqual(invoke.call_args.args[1:], arguments)
 
     def test_database_unavailable_is_not_reported_as_zero_accounts(self):
         with patch("ispbandits.menu._database_counts", return_value=None), \
@@ -340,12 +401,11 @@ class OriginalMenuOperationalCommandTests(unittest.TestCase):
                      "monthly": "80.00 GiB", "received": "1.30 GiB", "sent": "1.20 GiB",
                      "month": "2026-11"}
         sessions = [{"username": "alice", "protocol": "openssh", "observed_processes": 2}]
+        resources = {"cpu": "7.0%", "memory": "512MB / 2048MB",
+                     "memory_percent": "25%", "uptime": "2 days, 3 hours"}
         with patch("ispbandits.menu._database_counts", return_value=counts), \
              patch("ispbandits.menu._cpu_details", return_value=("CPU model", "2 Cores (load 0.10)")), \
-             patch("ispbandits.menu._cpu_usage_percent", return_value="7% (sample)"), \
-             patch("ispbandits.menu._memory", return_value="512 / 2048 MiB"), \
-             patch("ispbandits.menu._memory_percent", return_value="25%"), \
-             patch("ispbandits.menu._uptime_readable", return_value="2 days, 3 hours"), \
+             patch("ispbandits.menu.system_monitor.resource_snapshot", return_value=resources), \
              patch("ispbandits.menu._domain", return_value="vpn.example.test"), \
              patch("ispbandits.menu._public_interface_ip", return_value="203.0.113.10"), \
              patch("ispbandits.menu._storage_summary", return_value="18% used (18 / 100 GiB)"), \
@@ -354,26 +414,33 @@ class OriginalMenuOperationalCommandTests(unittest.TestCase):
              patch("ispbandits.menu._collect_checks", return_value={}):
             snapshot = menu._dashboard_snapshot(Path("/tmp/db"))
         overview = "\n".join(snapshot["overview"])
-        self.assertIn("CPU Usage       : 7% (sample)", overview)
-        self.assertIn("Total RAM", overview)
+        self.assertIn("CPU Usage       : 7.0%", overview)
+        self.assertIn("Total RAM       : 512MB / 2048MB (25%)", overview)
+        self.assertIn("System Uptime   : 2 days, 3 hours", overview)
         self.assertIn("Storage", overview)
-        self.assertIn("Daily Bandwidth : 2.50 GiB (ens18, vnStat)", overview)
-        self.assertIn("Monthly Bandwidth: 80.00 GiB (2026-11)", overview)
-        self.assertIn("1 active username(s), 2 observed process(es)", overview)
+        self.assertIn("Data Used Today : 2.50 GiB", overview)
+        self.assertIn("Data Used Month : 80.00 GiB", overview)
+        self.assertIn("1 active username(s), 2 active-device estimate(s)", overview)
         self.assertEqual(sessions, snapshot["ssh_sessions"])
+
+    def test_dashboard_reports_collecting_vnstat_without_since_boot_substitute(self):
+        with patch("ispbandits.menu._database_counts", return_value=None), \
+             patch("ispbandits.menu._cpu_details", return_value=("CPU", "2 Cores")), \
+             patch("ispbandits.menu.system_monitor.resource_snapshot", return_value={
+                 "cpu": "unavailable", "memory": "unavailable",
+                 "memory_percent": "unavailable", "uptime": "unavailable"}), \
+             patch("ispbandits.menu.system_monitor.bandwidth_snapshot", return_value={
+                 "source": "collecting", "daily": "collecting", "monthly": "collecting"}), \
+             patch("ispbandits.menu._online_ssh_snapshot", return_value=[]), \
+             patch("ispbandits.menu._collect_checks", return_value={}):
+            overview = "\n".join(menu._dashboard_snapshot(Path("/missing/db"))["overview"])
+        self.assertIn("Data Used Today : collecting vnStat history", overview)
+        self.assertIn("Data Used Month : collecting vnStat history", overview)
+        self.assertNotIn("since boot", overview.lower())
 
     def test_systemd_timeout_is_reported_as_unavailable(self):
         with patch("ispbandits.menu.subprocess.run", side_effect=subprocess.TimeoutExpired("systemctl", 2)):
             self.assertEqual(menu._service_state("nginx.service"), "unavailable")
-
-    def test_cpu_usage_is_sampled_from_procfs_and_handles_missing_data(self):
-        samples = iter(("cpu 100 0 0 20 0 0 0 0 0 0\n",
-                        "cpu 130 0 0 30 0 0 0 0 0 0\n"))
-        with patch("ispbandits.menu.Path.read_text", side_effect=lambda *a, **k: next(samples)), \
-             patch("ispbandits.menu.time.sleep"):
-            self.assertEqual("75% (sample)", menu._cpu_usage_percent())
-        with patch("ispbandits.menu.Path.read_text", side_effect=OSError("procfs unavailable")):
-            self.assertEqual("unavailable", menu._cpu_usage_percent())
 
     def test_overall_probe_timeout_returns_unknown_instead_of_hanging(self):
         def slow_probe():
@@ -447,6 +514,21 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
         # Initial dashboard, More Actions, returned dashboard, and a clean exit view.
         self.assertEqual(clear.call_count, 4)
 
+    def test_hidden_reference_key_is_rejected_from_main_menu(self):
+        answers = iter(("13", "", "0"))
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("ispbandits.menu.sys.stdin", self._TTY()), \
+             patch("builtins.input", side_effect=lambda *_args: next(answers)), \
+             patch("ispbandits.menu._show_dashboard"), \
+             patch("ispbandits.menu.menu_ui.clear_screen"), \
+             patch("ispbandits.menu._execute_reference_option") as execute, \
+             redirect_stdout(output):
+            result = menu.run_menu(Path(directory) / "db.sqlite")
+        self.assertEqual(result, 0)
+        self.assertIn("Unknown selection", output.getvalue())
+        execute.assert_not_called()
+
     def test_dumb_terminal_uses_plain_repaint_fallback(self):
         output = self._TTY()
         with patch("ispbandits.menu_ui.sys.stdout", output), \
@@ -465,18 +547,34 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
              patch("ispbandits.menu._online_ssh_snapshot", return_value=active):
             rows = menu._section_extra(Path("/tmp/db"), "T")
         rendered = "\n".join(str(item[0] if isinstance(item, tuple) else item) for item in rows)
-        self.assertIn("ACTIVE SSH SESSIONS", rendered)
+        self.assertIn("ACTIVE CONNECTIONS", rendered)
+        self.assertIn("ACTIVE DEVICES", rendered)
         self.assertIn("alice", rendered)
         self.assertIn("2", rendered)
-        self.assertIn("do not identify unique devices", rendered)
+        self.assertIn("process estimates, not unique devices", rendered)
 
     def test_traffic_section_reports_no_sessions_without_inactive_accounts(self):
         with patch("ispbandits.menu._collect_checks", return_value={}), \
              patch("ispbandits.menu._online_ssh_snapshot", return_value=[]):
             rows = menu._section_extra(Path("/tmp/db"), "T")
         rendered = "\n".join(str(item[0] if isinstance(item, tuple) else item) for item in rows)
-        self.assertIn("No active SSH/Dropbear processes observed.", rendered)
-        self.assertNotIn("USERNAME", rendered)
+        self.assertIn("No active SSH/Dropbear processes were observed.", rendered)
+        self.assertIn("USERNAME", rendered)
+        self.assertIn("ACTIVE DEVICES", rendered)
+
+    def test_section_menu_omits_long_description_and_action_hints(self):
+        output = io.StringIO()
+        with patch("ispbandits.menu_ui._dimensions", return_value=(80, 24)), \
+             patch.dict("os.environ", {"TERM": "xterm", "NO_COLOR": "1"}), \
+             redirect_stdout(output):
+            menu_ui.show_section(
+                "P", "Protocol Management", "Long section explanation",
+                [("1", "Create SSH", "A long explanation for this action")],
+            )
+        rendered = output.getvalue()
+        self.assertIn("[1] Create SSH", rendered)
+        self.assertNotIn("Long section explanation", rendered)
+        self.assertNotIn("A long explanation", rendered)
 
     def test_more_actions_hub_contains_letters_and_legacy_menu(self):
         output = io.StringIO()
@@ -527,9 +625,9 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
             "overview": [
                 "OS Linux        : Ubuntu 24.04 LTS",
                 "CPU Name        : Test CPU",
-                "Daily Bandwidth : 40.67 GiB (ens18, vnStat)",
-                "Monthly Bandwidth: 483.79 GiB (2026-11)",
-                "Online SSH      : 2 active username(s), 3 observed process(es) (approximate)",
+                "Data Used Today : 40.67 GiB",
+                "Data Used Month : 483.79 GiB",
+                "Online SSH      : 2 active username(s), 3 active-device estimate(s)",
             ],
             "health": [
                 ("SSH unit", "active"), ("NGINX unit", "active"),
@@ -551,17 +649,19 @@ class MenuInteractionAndTerminalTests(unittest.TestCase):
         self.assertIn("Server Informations", rendered)
         self.assertNotIn("NEVERBANDITS MENU", rendered)
         self.assertIn("[01] SSHWS", rendered)
-        self.assertIn("[03] VLESS", rendered)
-        self.assertIn("[04] TROJAN", rendered)
+        self.assertIn("[02] VLESS", rendered)
+        self.assertIn("[03] TROJAN", rendered)
+        self.assertIn("[04] REBOOT", rendered)
+        self.assertIn("[05] RESTART", rendered)
+        self.assertIn("[06] RENEW CERT", rendered)
         self.assertIn("[2]", rendered)
         self.assertIn("[3]", rendered)
         self.assertIn("[1]", rendered)
-        self.assertNotIn("[02] VMESS", rendered)
         self.assertNotIn("[N/A]", rendered)
-        self.assertNotIn("[55] XRAY-CORE MENU", rendered)
-        self.assertNotIn("[77] SWAPRAM MENU", rendered)
-        self.assertIn("Daily Bandwidth", rendered)
-        self.assertIn("Monthly Bandwidth", rendered)
+        self.assertNotIn("[14] XRAY-CORE MENU", rendered)
+        self.assertNotIn("[15] SERVER INFO", rendered)
+        self.assertIn("Data Used Today", rendered)
+        self.assertIn("Data Used Month", rendered)
         self.assertIn("Online SSH", rendered)
         self.assertIn("TROJAN : OFF", rendered)
         self.assertNotIn("EXTERNAL CLIENT CONNECTIVITY: NOT TESTED", rendered)

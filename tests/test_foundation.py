@@ -4,9 +4,10 @@ import unittest
 import datetime as dt
 from pathlib import Path
 import os
-import pwd
+import subprocess
 import io
 import tarfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ispbandits import backup, collector, database, sessions, provisioning
@@ -181,57 +182,65 @@ class FoundationTests(unittest.TestCase):
         conn.close()
 
     def test_online_view_counts_only_managed_protocol_processes(self):
-        account = pwd.getpwuid(os.getuid()) if os.getuid() != 0 else pwd.getpwnam("nobody")
-        username = account.pw_name
+        username = "sessionuser"
         database.initialize(self.db)
         database.add_user(self.db, username, "2999-01-01")
         database.link_protocol(self.db, username, "openssh", username)
-        proc = self.root / "proc"
-        for pid in ("101", "102", "103"):
-            proc_pid = proc / pid
-            proc_pid.mkdir(parents=True)
-            (proc_pid / "comm").write_text("sshd\n", encoding="utf-8")
-            (proc_pid / "status").write_text(f"Name:\tsshd\nUid:\t{account.pw_uid}\t{account.pw_uid}\t{account.pw_uid}\t{account.pw_uid}\n", encoding="utf-8")
-        with patch.object(sessions.os, "geteuid", return_value=0):
-            rows = sessions.online_ssh_processes(self.db, proc)
+        process_output = (f"{username} 101 sshd\n{username} 102 sshd\n"
+                          f"{username} 103 sshd\n{username} 106 sshd-session\n"
+                          f"root 104 sshd\n{username} 105 bash\n")
+        with patch.object(sessions.os, "geteuid", return_value=0), \
+             patch.object(sessions.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 ["ps"], 0, process_output, "")), \
+             patch.object(sessions.pwd, "getpwnam", return_value=SimpleNamespace(pw_shell="/bin/false")):
+            rows = sessions.online_ssh_processes(self.db)
         self.assertEqual(1, len(rows))
         self.assertEqual(username, rows[0]["username"])
         self.assertEqual("openssh", rows[0]["protocol"])
-        self.assertEqual(3, rows[0]["observed_processes"])
+        self.assertEqual(4, rows[0]["observed_processes"])
 
     def test_online_view_omits_managed_users_without_active_processes(self):
-        account = pwd.getpwuid(os.getuid()) if os.getuid() != 0 else pwd.getpwnam("nobody")
-        username = account.pw_name
+        username = "sessionuser"
         database.initialize(self.db)
         database.add_user(self.db, username, "2999-01-01")
         database.link_protocol(self.db, username, "openssh", username)
-        proc = self.root / "empty-proc"
-        proc.mkdir()
-        with patch.object(sessions.os, "geteuid", return_value=0):
-            rows = sessions.online_ssh_processes(self.db, proc)
+        process_output = f"root 101 sshd\n{username} 102 bash\n"
+        with patch.object(sessions.os, "geteuid", return_value=0), \
+             patch.object(sessions.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 ["ps"], 0, process_output, "")), \
+             patch.object(sessions.pwd, "getpwnam", return_value=SimpleNamespace(pw_shell="/bin/false")):
+            rows = sessions.online_ssh_processes(self.db)
         self.assertEqual([], rows)
 
     def test_online_view_aggregates_ssh_and_dropbear_under_one_username(self):
-        account = pwd.getpwuid(os.getuid()) if os.getuid() != 0 else pwd.getpwnam("nobody")
-        username = account.pw_name
+        username = "sessionuser"
         database.initialize(self.db)
         database.add_user(self.db, username, "2999-01-01")
         database.link_protocol(self.db, username, "openssh", username)
         database.link_protocol(self.db, username, "dropbear", username)
-        proc = self.root / "combined-proc"
-        for pid, command in (("201", "sshd"), ("202", "sshd"), ("203", "dropbear")):
-            proc_pid = proc / pid
-            proc_pid.mkdir(parents=True)
-            (proc_pid / "comm").write_text(command + "\n", encoding="utf-8")
-            (proc_pid / "status").write_text(
-                f"Name:\t{command}\nUid:\t{account.pw_uid}\t{account.pw_uid}\t"
-                f"{account.pw_uid}\t{account.pw_uid}\n", encoding="utf-8")
-        with patch.object(sessions.os, "geteuid", return_value=0):
-            rows = sessions.online_ssh_processes(self.db, proc)
+        process_output = f"{username} 201 sshd\n{username} 202 sshd\n{username} 203 dropbear\n"
+        with patch.object(sessions.os, "geteuid", return_value=0), \
+             patch.object(sessions.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 ["ps"], 0, process_output, "")), \
+             patch.object(sessions.pwd, "getpwnam", return_value=SimpleNamespace(pw_shell="/bin/false")):
+            rows = sessions.online_ssh_processes(self.db)
         self.assertEqual(1, len(rows))
         self.assertEqual(username, rows[0]["username"])
         self.assertEqual("dropbear/openssh", rows[0]["protocol"])
         self.assertEqual(3, rows[0]["observed_processes"])
+
+    def test_online_view_excludes_accounts_without_the_locked_shell(self):
+        username = "sessionuser"
+        database.initialize(self.db)
+        database.add_user(self.db, username, "2999-01-01")
+        database.link_protocol(self.db, username, "openssh", username)
+        process_output = f"{username} 301 sshd\n"
+        with patch.object(sessions.os, "geteuid", return_value=0), \
+             patch.object(sessions.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 ["ps"], 0, process_output, "")), \
+             patch.object(sessions.pwd, "getpwnam", return_value=SimpleNamespace(pw_shell="/usr/sbin/nologin")):
+            rows = sessions.online_ssh_processes(self.db)
+        self.assertEqual([], rows)
 
     def test_xray_credentials_are_created_once_and_rotated_explicitly(self):
         database.initialize(self.db)

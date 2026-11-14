@@ -216,7 +216,7 @@ class InstallerActivationTests(unittest.TestCase):
         self.assertIn("Trojan inbound listener only", rendered)
         self.assertRegex(rendered, r"VLESS inbound listener only\s+unreachable")
         self.assertRegex(rendered, r"Trojan inbound listener only\s+ready")
-        self.assertIn("not external client authentication", rendered)
+        self.assertIn("EXTERNAL CLIENT CONNECTIVITY: NOT TESTED", rendered)
 
 
 class CertbotRenewalHookTests(unittest.TestCase):
