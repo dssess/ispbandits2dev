@@ -63,16 +63,16 @@ class SSHWebSocketTests(unittest.TestCase):
             cli._print_connection_details("alice", [], has_ssh=True, ssh_ports=[2222],
                                           expiry_date="2026-12-13", ssh_password="ssh-secret")
         rendered = output.getvalue()
-        self.assertIn("NEVERBANDITS  |  ACCOUNT READY", rendered)
-        self.assertIn("203.0.113.42", rendered)
-        self.assertIn("Username        : alice", rendered)
-        self.assertIn("Password        : ssh-secret", rendered)
-        self.assertIn("Expires         : 2026-12-13", rendered)
-        self.assertIn("SSH  |  HTTP CUSTOM  |  TCP PORT 80", rendered)
-        self.assertIn("Server          : vpn.example.test", rendered)
-        self.assertIn("Payload (copy into HTTP Custom):", rendered)
+        self.assertIn("Username : alice", rendered)
+        self.assertIn("Password : ssh-secret", rendered)
+        self.assertIn("Expired On : 2026-12-13", rendered)
+        self.assertIn("IP Address : 203.0.113.42", rendered)
+        self.assertIn("Host : vpn.example.test", rendered)
+        self.assertIn("SSH-WS : 80", rendered)
+        self.assertIn("Payload (copy into HTTP Custom) :", rendered)
         self.assertIn("GET / HTTP/1.1[crlf]Host: vpn.example.test[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]", rendered)
-        self.assertIn("SSH is on port 80 only", rendered)
+        for unsupported in ("OpenSSH", "Dropbear", "SSH-SSL-WS", "SSL/TLS", "UDPGW", "2222", ":443"):
+            self.assertNotIn(unsupported, rendered)
         self.assertNotIn("wss://", rendered)
         self.assertNotIn("vless://", rendered)
         self.assertNotIn("trojan://", rendered)
@@ -105,10 +105,20 @@ class SSHWebSocketTests(unittest.TestCase):
         self.assertIn(
             f"trojan://{secret}@vpn.example.test:443?path=%2Ftrojan-ws&security=tls"
             "&host=vpn.example.test&type=ws&sni=vpn.example.test#TROJAN_WS_alice", rendered)
+        self.assertIn("Remarks : alice", rendered)
+        self.assertIn("Host/IP : vpn.example.test (203.0.113.42)", rendered)
+        self.assertIn("Port : 443", rendered)
+        self.assertIn(f"Key : {secret}", rendered)
+        self.assertIn("Network : ws", rendered)
         self.assertIn("path=%2Ftrojan-ws", rendered)
+        self.assertIn("Path : /trojan-ws", rendered)
         self.assertIn("security=tls", rendered)
-        self.assertIn("Server          : vpn.example.test:443", rendered)
-        self.assertEqual(1, rendered.count(secret))
+        self.assertIn("Link WS : trojan://", rendered)
+        self.assertIn("Expired On : 2026-12-13", rendered)
+        self.assertEqual(2, rendered.count(secret))
+        for unsupported in ("trojan-go://", "type=grpc", "serviceName=", "Link GO", "Link GRPC",
+                            "Trojan Config", ":8443", ":81"):
+            self.assertNotIn(unsupported, rendered)
         self.assertNotIn("vless://", rendered)
         self.assertNotIn("SSH-WS endpoint", rendered)
 

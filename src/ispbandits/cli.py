@@ -525,6 +525,8 @@ def _print_connection_details(username: str, credentials: list[dict[str, str]],
     protocols.extend((item["protocol"].upper(), item["protocol"])
                      for item in credentials if item.get("protocol") in {"vless", "trojan"})
     protocol_names = ", ".join(label for label, _protocol in protocols) or "Protocol details"
+    protocol_kinds = {str(item.get("protocol", "")) for item in credentials}
+    formatted_receipt = has_ssh or "trojan" in protocol_kinds
 
     addresses: list[str] = []
     if host:
@@ -546,29 +548,52 @@ def _print_connection_details(username: str, credentials: list[dict[str, str]],
         print("╰" + "─" * (width - 2) + "╯")
 
     quota = "Unlimited" if limit_gb in (None, 0) else f"{limit_gb} GB lifetime (shared across protocols)"
-    summary = [("Username", username), ("Protocol(s)", protocol_names)]
-    if expiry_date:
-        summary.append(("Expires", expiry_date))
-    summary.append(("Bandwidth quota", quota))
-    if host:
-        summary.append(("Server", host))
-        summary.append(("Server IP", ", ".join(addresses) if addresses else "DNS lookup unavailable"))
-    card("NEVERBANDITS  |  ACCOUNT READY", summary)
+    divider = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    def print_fields(rows: list[tuple[str, str]]) -> None:
+        for label, value in rows:
+            print(f"{label} : {value}")
+
+    if not formatted_receipt:
+        summary = [("Username", username), ("Protocol(s)", protocol_names)]
+        if expiry_date:
+            summary.append(("Expires", expiry_date))
+        summary.append(("Bandwidth quota", quota))
+        if host:
+            summary.append(("Server", host))
+            summary.append(("Server IP", ", ".join(addresses) if addresses else "DNS lookup unavailable"))
+        card("NEVERBANDITS  |  ACCOUNT READY", summary)
 
     if has_ssh:
         if host and _ssh_http_ready():
-            card("SSH  |  HTTP CUSTOM  |  TCP PORT 80", [
-                ("Server", host), ("Port", "80 / TCP"),
+            print_fields([
                 ("Username", username),
-                ("Password", ssh_password if ssh_password is not None else "shown above"),
+                ("Password", ssh_password if ssh_password is not None else "not available"),
+                ("Expired On", expiry_date or "Not set"),
+                ("Bandwidth quota", quota),
             ])
-            print("Payload (copy into HTTP Custom):")
+            print(divider)
+            print_fields([
+                ("IP Address", ", ".join(addresses) if addresses else "DNS lookup unavailable"),
+                ("Host", host),
+                ("SSH-WS", "80"),
+            ])
+            print(divider)
+            print("Payload (copy into HTTP Custom) :")
             print(f"GET / HTTP/1.1[crlf]Host: {host}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]")
-            print("SSH is on port 80 only. Verify the SSH host key on first connection.")
         else:
-            ports = ssh_ports if ssh_ports is not None else _configured_ssh_ports()
-            detail = f"Server-side sshd port(s): {','.join(map(str, ports))}" if ports else "Check the local sshd listener."
-            card("SSH  |  HTTP CUSTOM", [("Status", "Port-80 relay unavailable"), ("Note", detail)])
+            print_fields([
+                ("Username", username),
+                ("Expired On", expiry_date or "Not set"),
+                ("Bandwidth quota", quota),
+            ])
+            print(divider)
+            print_fields([
+                ("IP Address", ", ".join(addresses) if addresses else "DNS lookup unavailable"),
+                ("Host", host or "Not configured"),
+                ("SSH-WS", "Unavailable (expected port 80)"),
+            ])
+            print("HTTP Custom relay is unavailable; no connection payload was issued.")
 
     from urllib.parse import quote
     for item in credentials:
@@ -581,19 +606,37 @@ def _print_connection_details(username: str, credentials: list[dict[str, str]],
         if protocol == "vless":
             link = (f"vless://{item['credential']}@{host}:443?encryption=none&security=tls"
                     f"&sni={host}&type=ws&host={host}&path={quote('/vless', safe='')}#{username}-vless")
-            card("VLESS  |  WEBSOCKET + TLS", [
+            rows = [
                 ("Server", f"{host}:443"), ("Path", "/vless"), ("Transport", "WebSocket over TLS"),
-            ])
-        else:
-            secret = quote(item["credential"], safe="")
-            profile_name = quote(username, safe="")
-            link = (f"trojan://{secret}@{host}:443?path={quote('/trojan-ws', safe='')}"
-                    f"&security=tls&host={host}&type=ws&sni={host}#TROJAN_WS_{profile_name}")
-            card("TROJAN  |  WEBSOCKET + TLS", [
-                ("Server", f"{host}:443"), ("Path", "/trojan-ws"), ("Transport", "WebSocket over TLS"),
-            ])
-        print(f"{protocol.upper()} import link (copy; secret shown once):")
-        print(link)
+            ]
+            if formatted_receipt:
+                rows.extend([("Expired On", expiry_date or "Not set"), ("Bandwidth quota", quota)])
+            card("VLESS  |  WEBSOCKET + TLS", rows)
+            print("VLESS import link (copy; secret shown once):")
+            print(link)
+            continue
+
+        secret = item["credential"]
+        escaped_secret = quote(secret, safe="")
+        profile_name = quote(username, safe="")
+        host_ip = f"{host} ({', '.join(addresses)})" if addresses else host
+        print_fields([
+            ("Remarks", username),
+            ("Host/IP", host_ip),
+            ("Port", "443"),
+            ("Key", secret),
+            ("Network", "ws"),
+            ("Path", "/trojan-ws"),
+        ])
+        print(divider)
+        link = (f"trojan://{escaped_secret}@{host}:443?path={quote('/trojan-ws', safe='')}"
+                f"&security=tls&host={host}&type=ws&sni={host}#TROJAN_WS_{profile_name}")
+        print(f"Link WS : {link}")
+        print(divider)
+        print_fields([
+            ("Expired On", expiry_date or "Not set"),
+            ("Bandwidth quota", quota),
+        ])
 
 
 def _rollback_unpublished_account(path: Path, username: str, ssh_password: object,
