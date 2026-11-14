@@ -35,15 +35,18 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--expires", required=True, help="expiry date YYYY-MM-DD")
     add.add_argument("--max-logins", type=int, default=2)
     add.add_argument("--limit-bytes", type=int, default=0)
-    create = sub.add_parser("account-create", help="create a Linux SSH-WebSocket account and/or Xray protocol identities")
+    create = sub.add_parser("account-create", help="advanced account creation for explicitly selected protocols")
     create.add_argument("username")
     create.add_argument("--expires", required=True, help="expiry date YYYY-MM-DD")
     create.add_argument("--limit-gb", type=int, default=0,
                         help="shared lifetime quota in decimal GB (0 = unlimited); requires the active experimental meter and a fresh snapshot")
     create.add_argument("--protocols", nargs="+", choices=("openssh", "vless", "trojan"),
-                        default=("openssh", "vless", "trojan"))
+                        default=("openssh",))
     create.add_argument("--prompt-password", action="store_true",
                         help="prompt twice without echoing for a chosen OpenSSH password")
+    sub.add_parser("sshws-create", help="interactively create one HTTP Custom SSH account on port 80 and show its connection sheet")
+    sub.add_parser("vless-create", help="interactively create one VLESS account and import link")
+    sub.add_parser("trojan-create", help="interactively create one Trojan account and import link")
     sub.add_parser("account-list", help="list accounts and provisioned protocol state without secrets")
     show = sub.add_parser("account-show", help="show one account, protocol state, and traffic breakdown without secrets")
     show.add_argument("username")
@@ -81,7 +84,10 @@ def parser() -> argparse.ArgumentParser:
     xc.add_argument("--output", default="/etc/ispbandits-dev/xray.json")
     xc.add_argument("--vless-port", type=int, default=10001,
                     help="loopback VLESS WebSocket port behind Nginx (default: %(default)s)")
-    xc.add_argument("--trojan-port", type=int, default=8443)
+    xc.add_argument("--trojan-port", type=int, default=10002,
+                    help="loopback Trojan WebSocket port behind Nginx (default: %(default)s)")
+    xc.add_argument("--legacy-trojan-port", type=int, default=None,
+                    help="temporarily retain an old direct Trojan TLS listener during migration")
     xc.add_argument("--api-port", type=int, default=10085)
     xc.add_argument("--xray-bin", default=shutil.which("xray") or "/usr/local/bin/xray")
     xc.add_argument("--check-only", action="store_true", help="validate without writing the secret-bearing config")
@@ -91,7 +97,17 @@ def parser() -> argparse.ArgumentParser:
     r = sub.add_parser("restore", help="validate and restore a backup; preserves a rollback backup")
     r.add_argument("archive")
     r.add_argument("--dir", default=None)
+    r.add_argument("--confirm", choices=("RESTORE",), required=True,
+                   help="required exact destructive-operation confirmation")
     v = sub.add_parser("verify", help="run SQLite integrity check")
+    reboot = sub.add_parser("reboot", help="queue a server reboot after explicit confirmation")
+    reboot.add_argument("--confirm", choices=("REBOOT",), required=True)
+    restart = sub.add_parser("service-restart", help="restart only managed Nginx, Xray, and SSH relay services")
+    restart.add_argument("--confirm", choices=("RESTART",), required=True)
+    renew_tls = sub.add_parser("tls-renew", help="run the managed Certbot renewal check and validate the installed TLS certificate")
+    renew_tls.add_argument("--confirm", choices=("RENEW",), required=True)
+    sub.add_parser("bandwidth", help="show host network-interface byte counters; not per-user usage")
+    sub.add_parser("process-list", help="show a read-only process summary")
     c = sub.add_parser("collect", help="collect Xray and SSH-meter counters atomically")
     c.add_argument("--dry-run", action="store_true", help="roll back after validating inputs")
     c.add_argument("--xray-only", action="store_true", help="collect VLESS/Trojan until the SSH network meter is installed")
@@ -180,6 +196,14 @@ def _ssh_meter_timer_active() -> bool:
         return False
 
 
+def _quota_enforcement_timer_active() -> bool:
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "ispbandits-ssh-collect.timer"],
+                              check=False, capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _xray_service_active() -> bool:
     return _service_active("ispbandits-xray.service")
 
@@ -193,7 +217,8 @@ def _service_active(unit: str) -> bool:
 
 
 def _ssh_meter_ready(path: Path) -> bool:
-    if not _ssh_meter_timer_active() or not _xray_service_active():
+    if (not _ssh_meter_timer_active() or not _quota_enforcement_timer_active()
+            or not _xray_service_active()):
         return False
     try:
         ssh_meter.load_managed_openssh_users(path)
@@ -232,7 +257,8 @@ def _reconcile_xray_if_active(path: Path) -> bool:
     if not active and not output.exists():
         return False
     config = xray_config.build_config(path, "/etc/ispbandits-dev/tls/current/fullchain.pem",
-                                     "/etc/ispbandits-dev/tls/current/privkey.pem")
+                                     "/etc/ispbandits-dev/tls/current/privkey.pem",
+                                     legacy_trojan_port=_legacy_trojan_port())
     expected = json.dumps(config, indent=2, sort_keys=True) + "\n"
     try:
         current = output.read_text(encoding="utf-8")
@@ -244,6 +270,143 @@ def _reconcile_xray_if_active(path: Path) -> bool:
         else:
             xray_config.write_config(config, output)
     return active
+
+
+def _systemd_active_state(unit: str) -> str:
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "--property=ActiveState", "--value", unit],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"Could not determine the current state of {unit}; no services were stopped") from exc
+    state = result.stdout.strip().lower()
+    if result.returncode != 0 or state not in {
+        "active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance", "not-found",
+    }:
+        raise RuntimeError(f"Could not determine the current state of {unit}; no services were stopped")
+    return state
+
+
+def _resume_restore_units(path: Path, active_units: set[str],
+                          timers: tuple[str, ...], services: tuple[str, ...]) -> list[str]:
+    errors: list[str] = []
+    try:
+        _reconcile_xray_if_active(path)
+    except Exception as exc:
+        errors.append(f"Xray configuration reconciliation: {exc}")
+        return errors
+    ordered_services = ("ispbandits-xray.service",) + tuple(
+        unit for unit in services if unit != "ispbandits-xray.service"
+    )
+    for unit in ordered_services:
+        if unit not in active_units:
+            continue
+        try:
+            result = subprocess.run(["systemctl", "start", unit], check=False,
+                                    capture_output=True, timeout=30)
+            if result.returncode != 0:
+                errors.append(unit)
+            elif unit == "ispbandits-xray.service" and not _xray_service_active():
+                errors.append(unit)
+        except (OSError, subprocess.SubprocessError):
+            errors.append(unit)
+    for unit in timers:
+        if unit not in active_units:
+            continue
+        try:
+            result = subprocess.run(["systemctl", "start", unit], check=False,
+                                    capture_output=True, timeout=15)
+            if result.returncode != 0:
+                errors.append(unit)
+        except (OSError, subprocess.SubprocessError):
+            errors.append(unit)
+    return errors
+
+
+def _restore_managed_database(path: Path, archive: str, directory: Path) -> Path | None:
+    timers = ("ispbandits-collect.timer", "ispbandits-ssh-collect.timer",
+              "ispbandits-expire.timer", "ispbandits-ssh-meter.timer")
+    services = ("ispbandits-collect.service", "ispbandits-ssh-collect.service",
+                "ispbandits-expire.service", "ispbandits-ssh-meter.service",
+                "ispbandits-xray.service")
+    with backup.prepare_restore(archive, path.parent) as staged:
+        # Snapshot every managed unit before changing service state. An unknown
+        # systemd response aborts safely instead of assuming a unit was inactive.
+        unit_states = {unit: _systemd_active_state(unit) for unit in (*timers, *services)}
+        active_units = {unit for unit, state in unit_states.items() if state == "active"}
+        stopped_units: list[str] = []
+        for unit in (*timers, *services):
+            if unit not in active_units:
+                continue
+            try:
+                stopped = subprocess.run(["systemctl", "stop", unit], check=False,
+                                         capture_output=True, timeout=15)
+                state_after = _systemd_active_state(unit)
+            except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+                pause_error = f"Could not quiesce {unit}: {exc}"
+                break
+            if stopped.returncode != 0 or state_after == "active":
+                pause_error = f"Could not quiesce managed unit {unit}"
+                break
+            stopped_units.append(unit)
+        else:
+            pause_error = ""
+        if pause_error:
+            recovery_errors = _resume_restore_units(path, active_units, timers, services)
+            suffix = ("; recovery failed for: " + ", ".join(recovery_errors)) if recovery_errors else ""
+            raise RuntimeError(pause_error + "; database was not restored" + suffix)
+
+        rollback: Path | None = None
+        try:
+            rollback = backup.install_validated_restore(path, staged, directory)
+            resume_errors = _resume_restore_units(path, active_units, timers, services)
+            if resume_errors:
+                raise RuntimeError("Previously active units failed to resume: " + ", ".join(resume_errors))
+            return rollback
+        except Exception as restore_error:
+            # Prevent any partially resumed collector/Xray from operating while
+            # restoring the rollback database.
+            stop_errors = []
+            for unit in reversed((*timers, *services)):
+                if unit in active_units:
+                    try:
+                        stopped = subprocess.run(["systemctl", "stop", unit], check=False,
+                                                 capture_output=True, timeout=15)
+                        if stopped.returncode != 0:
+                            stop_errors.append(unit)
+                    except (OSError, subprocess.SubprocessError):
+                        stop_errors.append(unit)
+
+            rollback_error: Exception | None = None
+            if rollback is not None and rollback.is_file():
+                try:
+                    with backup.prepare_restore(rollback, path.parent) as original:
+                        backup.install_validated_restore(path, original, directory)
+                except Exception as exc:
+                    rollback_error = exc
+
+            if rollback_error is None:
+                recovery_errors = _resume_restore_units(path, active_units, timers, services)
+                details = []
+                if recovery_errors:
+                    details.append("previously active units failed to resume: " + ", ".join(recovery_errors))
+                if stop_errors:
+                    details.append("units could not be stopped before rollback: " + ", ".join(stop_errors))
+                suffix = ("; " + "; ".join(details)) if details else ""
+                raise RuntimeError("Restore failed; the original database was preserved or rolled back" + suffix) from restore_error
+
+            stopped_text = ", ".join(sorted(active_units)) or "none"
+            if stop_errors:
+                stopped_text += "; stop failed: " + ", ".join(stop_errors)
+            raise RuntimeError(
+                "CRITICAL: restore and database rollback both failed. Managed units were left stopped where possible "
+                f"to avoid serving inconsistent state (previously active: {stopped_text}). Inspect archive {rollback}."
+            ) from rollback_error
+
+
+def _legacy_trojan_port() -> int | None:
+    return 8443 if _install_info().get("trojan_legacy_8443") == "1" else None
 
 
 def _install_info() -> dict[str, str]:
@@ -258,18 +421,19 @@ def _install_info() -> dict[str, str]:
     return info
 
 
-def _sshws_ready() -> bool:
-    """Return true only for a managed, active Nginx + loopback bridge install."""
+def _ssh_http_ready() -> bool:
+    """Return true only for the managed HTTP Custom SSH listener on TCP port 80."""
     info = _install_info()
-    if info.get("ssh_websocket") != "1":
+    if info.get("ssh_http_custom") != "1":
         return False
-    for unit in ("nginx.service", "neverbandits-websockify.service"):
-        if not _service_active(unit):
-            return False
+    if not _service_active("neverbandits-ssh-http.service"):
+        return False
     try:
         target_port = int(info["ssh_target_port"])
         if not 1 <= target_port <= 65535:
             return False
+        with socket.create_connection(("127.0.0.1", 80), timeout=2):
+            pass
         with socket.create_connection(("127.0.0.1", target_port), timeout=2):
             return True
     except (KeyError, ValueError, OSError):
@@ -351,49 +515,85 @@ def _require_working_ssh_login(username: str) -> list[int]:
 
 def _print_connection_details(username: str, credentials: list[dict[str, str]],
                               has_ssh: bool = False,
-                              ssh_ports: list[int] | None = None) -> None:
+                              ssh_ports: list[int] | None = None,
+                              expiry_date: str | None = None,
+                              ssh_password: str | None = None,
+                              limit_gb: int | None = None) -> None:
     info = _install_info()
     host = info.get("domain", "").strip()
-    ports = ssh_ports if ssh_ports is not None else _configured_ssh_ports()
+    protocols = ([("SSH HTTP Custom", "") ] if has_ssh else [])
+    protocols.extend((item["protocol"].upper(), item["protocol"])
+                     for item in credentials if item.get("protocol") in {"vless", "trojan"})
+    protocol_names = ", ".join(label for label, _protocol in protocols) or "Protocol details"
+
+    addresses: list[str] = []
     if host:
         try:
             resolved = subprocess.run(["getent", "ahosts", host], check=False,
                                       capture_output=True, text=True, timeout=4)
             addresses = sorted({line.split()[0] for line in resolved.stdout.splitlines() if line.split()})
         except (OSError, subprocess.TimeoutExpired):
-            addresses = []
-        print(f"Host/domain: {host}")
-        print(f"Resolved IP address(es): {', '.join(addresses) if addresses else 'DNS lookup unavailable'}")
+            pass
+
+    def card(title: str, rows: list[tuple[str, str]]) -> None:
+        width = 72
+        print("╭" + "─" * (width - 2) + "╮")
+        print("│ " + title[:width - 4].ljust(width - 4) + " │")
+        print("├" + "─" * (width - 2) + "┤")
+        for label, value in rows:
+            line = f"{label:<16}: {value}"
+            print("│ " + line.ljust(width - 4) + " │")
+        print("╰" + "─" * (width - 2) + "╯")
+
+    quota = "Unlimited" if limit_gb in (None, 0) else f"{limit_gb} GB lifetime (shared across protocols)"
+    summary = [("Username", username), ("Protocol(s)", protocol_names)]
+    if expiry_date:
+        summary.append(("Expires", expiry_date))
+    summary.append(("Bandwidth quota", quota))
+    if host:
+        summary.append(("Server", host))
+        summary.append(("Server IP", ", ".join(addresses) if addresses else "DNS lookup unavailable"))
+    card("NEVERBANDITS  |  ACCOUNT READY", summary)
+
     if has_ssh:
-        if host and ports:
-            print(f"Direct SSH: host {host}; port(s) {','.join(map(str, ports))} (tunnel-only account)")
-            if _sshws_ready():
-                print(f"SSH WebSocket: ws://{host}:80/sshws")
-                print(f"SSH SSL-WebSocket: wss://{host}:443/sshws (TLS/SNI: {host})")
-                print("HTTP Custom payload (use its WebSocket mode; preserve CRLF markers):")
-                print(f"GET /sshws HTTP/1.1[crlf]Host: {host}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[crlf]Sec-WebSocket-Version: 13[crlf][crlf]")
-                print("The SSH password is printed above; verify the SSH host key on first connection.")
+        if host and _ssh_http_ready():
+            card("SSH  |  HTTP CUSTOM  |  TCP PORT 80", [
+                ("Server", host), ("Port", "80 / TCP"),
+                ("Username", username),
+                ("Password", ssh_password if ssh_password is not None else "shown above"),
+            ])
+            print("Payload (copy into HTTP Custom):")
+            print(f"GET / HTTP/1.1[crlf]Host: {host}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]")
+            print("SSH is on port 80 only. Verify the SSH host key on first connection.")
         else:
-            print("SSH endpoint: check this VPS sshd listener and firewall; Neverbandits did not change sshd.")
+            ports = ssh_ports if ssh_ports is not None else _configured_ssh_ports()
+            detail = f"Server-side sshd port(s): {','.join(map(str, ports))}" if ports else "Check the local sshd listener."
+            card("SSH  |  HTTP CUSTOM", [("Status", "Port-80 relay unavailable"), ("Note", detail)])
+
+    from urllib.parse import quote
     for item in credentials:
-        protocol = item["protocol"]
+        protocol = item.get("protocol")
         if protocol not in {"vless", "trojan"}:
             continue
         if not host:
-            print(f"{protocol.upper()} endpoint: hostname is not configured; no import link can be built.")
+            card(protocol.upper(), [("Status", "Hostname is not configured; no import link is available.")])
             continue
         if protocol == "vless":
-            port = 443
-            from urllib.parse import quote
-            link = (f"vless://{item['credential']}@{host}:{port}?encryption=none&security=tls"
+            link = (f"vless://{item['credential']}@{host}:443?encryption=none&security=tls"
                     f"&sni={host}&type=ws&host={host}&path={quote('/vless', safe='')}#{username}-vless")
+            card("VLESS  |  WEBSOCKET + TLS", [
+                ("Server", f"{host}:443"), ("Path", "/vless"), ("Transport", "WebSocket over TLS"),
+            ])
         else:
-            port = 8443
-            from urllib.parse import quote
             secret = quote(item["credential"], safe="")
-            link = (f"trojan://{secret}@{host}:{port}?security=tls&sni={host}"
-                    f"&type=tcp#{username}-trojan")
-        print(f"{protocol.upper()} import link (secret; shown once): {link}")
+            profile_name = quote(username, safe="")
+            link = (f"trojan://{secret}@{host}:443?path={quote('/trojan-ws', safe='')}"
+                    f"&security=tls&host={host}&type=ws&sni={host}#TROJAN_WS_{profile_name}")
+            card("TROJAN  |  WEBSOCKET + TLS", [
+                ("Server", f"{host}:443"), ("Path", "/trojan-ws"), ("Transport", "WebSocket over TLS"),
+            ])
+        print(f"{protocol.upper()} import link (copy; secret shown once):")
+        print(link)
 
 
 def _rollback_unpublished_account(path: Path, username: str, ssh_password: object,
@@ -412,8 +612,10 @@ def _rollback_unpublished_account(path: Path, username: str, ssh_password: objec
         try:
             if errors:
                 raise RuntimeError("Account record or Linux user cleanup failed")
-            config = xray_config.build_config(path, "/etc/ispbandits-dev/tls/current/fullchain.pem",
-                                              "/etc/ispbandits-dev/tls/current/privkey.pem")
+            config = xray_config.build_config(
+                path, "/etc/ispbandits-dev/tls/current/fullchain.pem",
+                "/etc/ispbandits-dev/tls/current/privkey.pem",
+                legacy_trojan_port=_legacy_trojan_port())
             if _xray_service_active():
                 xray_config.apply_config(config, "/etc/ispbandits-dev/xray.json", "/usr/local/bin/xray")
             else:
@@ -424,6 +626,261 @@ def _rollback_unpublished_account(path: Path, username: str, ssh_password: objec
             raise
     if errors:
         raise RuntimeError("Account record or Linux user cleanup failed") from errors[0]
+
+
+def _create_managed_account(path: Path, username: str, expiry: str, limit_gb: int,
+                            protocols: tuple[str, ...], ssh_password: str | None = None,
+                            prompt_password: bool = False) -> None:
+    if os.geteuid() != 0:
+        raise PermissionError("Creating managed system accounts requires root")
+    database.validate_username(username)
+    if limit_gb < 0:
+        raise ValueError("--limit-gb must be zero or greater")
+    if limit_gb and not _ssh_meter_ready(path):
+        raise RuntimeError("A shared lifetime quota requires the experimental SSH meter, the full quota collector, and a fresh valid snapshot")
+    install_info = _install_info()
+    if install_info.get("full_xray") != "1":
+        raise RuntimeError("A full Neverbandits network deployment is required before creating protocol accounts")
+    if any(protocol in protocols for protocol in ("vless", "trojan")):
+        if not install_info.get("domain"):
+            raise RuntimeError("The full install marker has no client hostname; no protocol account was created")
+        if not _xray_service_active():
+            raise RuntimeError("Xray is not active; no VLESS/Trojan account was created")
+        if not _service_active("nginx.service"):
+            raise RuntimeError("Nginx is not active; no TLS/WebSocket protocol account was created")
+    ssh_ports = _require_working_ssh_login(username) if "openssh" in protocols else []
+    if "openssh" in protocols:
+        if install_info.get("ssh_http_custom") != "1":
+            raise RuntimeError("The port-80 HTTP Custom SSH relay is not installed; no account was created")
+        if not _ssh_http_ready():
+            raise RuntimeError("The HTTP Custom SSH relay or OpenSSH backend is not active; no account was created")
+    if prompt_password:
+        if "openssh" not in protocols:
+            raise ValueError("--prompt-password requires openssh in --protocols")
+        ssh_password = getpass.getpass("New SSH password: ")
+        confirmation = getpass.getpass("Confirm SSH password: ")
+        if not ssh_password or ssh_password != confirmation:
+            raise ValueError("Passwords were empty or did not match; no account was created")
+
+    result = provisioning.create_managed_account(
+        path, username, expiry, protocols=tuple(protocols),
+        data_limit=limit_gb * 1_000_000_000, ssh_password=ssh_password)
+    xray_activated = False
+    xray_active = _xray_service_active()
+    xray_managed = xray_active or Path("/etc/ispbandits-dev/xray.json").exists()
+    if result["xray_credentials"]:
+        try:
+            xray_activated = _reconcile_xray_if_active(path)
+        except Exception as exc:
+            _rollback_unpublished_account(path, username, result["ssh_password"], xray_managed)
+            raise RuntimeError("Account creation rolled back because Xray config activation failed") from exc
+        if not xray_activated:
+            try:
+                _rollback_unpublished_account(path, username, result["ssh_password"], xray_managed)
+            except Exception as rollback_exc:
+                raise RuntimeError("Xray stopped during account creation and rollback was incomplete") from rollback_exc
+            raise RuntimeError("Account creation rolled back because Xray stopped before activation")
+    meter_active = _ssh_meter_timer_active()
+    if xray_active or meter_active:
+        try:
+            _seed_new_account_checkpoints(path, username, xray_active, meter_active)
+        except Exception as exc:
+            try:
+                _rollback_unpublished_account(path, username, result["ssh_password"], xray_managed)
+            except Exception as rollback_exc:
+                raise RuntimeError("Counter baseline failed and account rollback was incomplete; Xray was stopped if its configuration could not be reconciled") from rollback_exc
+            raise RuntimeError("Account creation rolled back because initial traffic-counter checkpoints could not be established") from exc
+    if "openssh" in protocols and not _ssh_http_ready():
+        try:
+            _rollback_unpublished_account(path, username, result["ssh_password"], xray_managed)
+        except Exception as rollback_exc:
+            raise RuntimeError("HTTP Custom SSH service failed before credential disclosure and rollback was incomplete") from rollback_exc
+        raise RuntimeError("Account creation rolled back because the HTTP Custom SSH service stopped")
+    if any(protocol in protocols for protocol in ("vless", "trojan")) and not _service_active("nginx.service"):
+        try:
+            _rollback_unpublished_account(path, username, result["ssh_password"], xray_managed)
+        except Exception as rollback_exc:
+            raise RuntimeError("Nginx failed before credential disclosure and rollback was incomplete") from rollback_exc
+        raise RuntimeError("Account creation rolled back because Nginx stopped")
+    if result["xray_credentials"] and not _xray_service_active():
+        try:
+            _rollback_unpublished_account(path, username, result["ssh_password"], xray_managed)
+        except Exception as rollback_exc:
+            raise RuntimeError("Xray failed before credential disclosure and rollback was incomplete") from rollback_exc
+        raise RuntimeError("Account creation rolled back because Xray stopped")
+    _print_connection_details(username, result["xray_credentials"],
+                              "openssh" in protocols, ssh_ports,
+                              result["expiry_date"], result["ssh_password"], limit_gb)
+    if result["xray_credentials"] and xray_activated:
+        print("Xray account is active. Save the import link; its credential is shown only once.")
+
+
+def _interactive_protocol_create(path: Path, protocol: str) -> None:
+    labels = {"openssh": "SSH HTTP Custom", "vless": "VLESS", "trojan": "Trojan"}
+    if os.geteuid() != 0:
+        raise PermissionError("Creating managed protocol accounts requires root")
+    try:
+        print(f"Create {labels[protocol]} account")
+        username = input("Username : ").strip()
+        database.validate_username(username)
+        password = None
+        if protocol == "openssh":
+            password = getpass.getpass("Password : ")
+            if not password:
+                raise ValueError("Password cannot be empty")
+            if any(character in password for character in ":\r\n"):
+                raise ValueError("Password cannot contain colon or newline")
+        raw_days = input("Expired (days): ").strip()
+        try:
+            days = int(raw_days)
+        except ValueError as exc:
+            raise ValueError("Expiry must be a whole number of days") from exc
+        if not 1 <= days <= 3650:
+            raise ValueError("Expiry must be between 1 and 3650 days")
+        expiry = (dt.date.today() + dt.timedelta(days=days)).isoformat()
+        raw_quota = input("Bandwidth quota (GB, lifetime; 0 = unlimited): ").strip()
+        try:
+            limit_gb = int(raw_quota)
+        except ValueError as exc:
+            raise ValueError("Quota must be a whole number of GB") from exc
+        if limit_gb < 0:
+            raise ValueError("Quota must be zero or greater")
+        quota_label = "Unlimited" if limit_gb == 0 else f"{limit_gb} GB"
+        print(f"\nExpires on: {expiry}  |  Lifetime quota: {quota_label}")
+        print("Creating this protocol only; no other protocol will be added.\n")
+        _create_managed_account(path, username, expiry, limit_gb, (protocol,), password)
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise RuntimeError("Account creation cancelled; no changes were made") from exc
+
+
+def _restart_managed_services() -> None:
+    if os.geteuid() != 0:
+        raise PermissionError("Restarting managed services requires root")
+    units = (
+        ("Nginx", "nginx.service"),
+        ("Xray", "ispbandits-xray.service"),
+        ("SSH HTTP Custom relay", "neverbandits-ssh-http.service"),
+    )
+    installed = 0
+    failures: list[str] = []
+    for label, unit in units:
+        load = subprocess.run(["systemctl", "show", "--property=LoadState", "--value", unit],
+                              check=False, capture_output=True, text=True, timeout=5)
+        if load.returncode != 0 or load.stdout.strip() != "loaded":
+            print(f"{label}: not installed/loaded; skipped")
+            continue
+        installed += 1
+        restart = subprocess.run(["systemctl", "restart", unit], check=False,
+                                 capture_output=True, text=True, timeout=45)
+        if restart.returncode != 0:
+            failures.append(f"{label}: restart failed")
+            print(f"{label}: restart FAILED")
+            continue
+        state = subprocess.run(["systemctl", "is-active", unit], check=False,
+                               capture_output=True, text=True, timeout=5)
+        if state.returncode == 0 and state.stdout.strip() == "active":
+            print(f"{label}: active after restart")
+        else:
+            failures.append(f"{label}: not active after restart")
+            print(f"{label}: not active after restart")
+    if installed == 0:
+        raise RuntimeError("No managed Nginx/Xray/SSH relay service units were found")
+    if failures:
+        raise RuntimeError("Managed service restart had failures: " + "; ".join(failures))
+    print("Managed service restart checks passed. This does not test external customer connectivity.")
+
+
+def _renew_managed_tls() -> None:
+    if os.geteuid() != 0:
+        raise PermissionError("Certificate renewal requires root")
+    domain = _install_info().get("domain", "").strip()
+    if not domain:
+        raise RuntimeError("No managed domain is configured")
+    certbot = shutil.which("certbot")
+    if not certbot:
+        raise RuntimeError("Certbot is not installed; no renewal was attempted")
+    result = subprocess.run([certbot, "renew", "--cert-name", domain], check=False,
+                            capture_output=True, text=True, timeout=300)
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"Certbot renewal check failed for {domain} (exit {result.returncode})")
+
+    refresh = Path("/usr/local/sbin/ispbandits-dev-refresh-tls")
+    if not refresh.is_file():
+        refresh = Path(__file__).resolve().parents[2] / "scripts" / "refresh-tls.sh"
+    if not refresh.is_file():
+        raise RuntimeError("The managed TLS refresh helper is missing; certificate paths were not changed")
+    applied = subprocess.run([str(refresh)], check=False, capture_output=True,
+                             text=True, timeout=120)
+    if applied.stdout:
+        print(applied.stdout.rstrip())
+    if applied.stderr:
+        print(applied.stderr.rstrip(), file=sys.stderr)
+    if applied.returncode != 0:
+        raise RuntimeError("Renewed certificate could not be safely applied; inspect the TLS refresh journal")
+
+    cert = Path("/etc/ispbandits-dev/tls/current/fullchain.pem")
+    verified = subprocess.run(["openssl", "x509", "-in", str(cert), "-noout",
+                               "-checkhost", domain, "-checkend", "86400"],
+                              check=False, capture_output=True, text=True, timeout=10)
+    if verified.returncode != 0:
+        raise RuntimeError(f"Installed certificate did not validate for {domain} or expires within 24 hours")
+    logger = shutil.which("logger")
+    if logger:
+        subprocess.run([logger, "-t", "ispbandits-tls-renew",
+                        f"certificate renewal check and validation succeeded for {domain}"],
+                       check=False, capture_output=True, timeout=3)
+    print(f"Certificate validated for {domain}; external client connectivity is not tested.")
+
+
+def _host_bandwidth() -> None:
+    try:
+        lines = Path("/proc/net/dev").read_text(encoding="ascii").splitlines()[2:]
+    except OSError as exc:
+        raise RuntimeError("Host interface counters are unavailable") from exc
+    received = transmitted = 0
+    interfaces = 0
+    for line in lines:
+        name, separator, counters = line.partition(":")
+        if not separator or name.strip() == "lo":
+            continue
+        values = counters.split()
+        if len(values) < 9:
+            continue
+        try:
+            received += int(values[0])
+            transmitted += int(values[8])
+            interfaces += 1
+        except ValueError:
+            continue
+    if not interfaces:
+        raise RuntimeError("No non-loopback interface counters were readable")
+
+    def humanize(value: int) -> str:
+        amount = float(value)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if amount < 1024 or unit == "TiB":
+                return f"{amount:.2f} {unit}"
+            amount /= 1024
+        return f"{amount:.2f} TiB"
+
+    print(f"Host interface totals across {interfaces} non-loopback interface(s):")
+    print(f"  Received: {humanize(received)}")
+    print(f"  Sent:     {humanize(transmitted)}")
+    print("These are host counters since boot/counter reset, not daily or per-user usage.")
+
+
+def _process_list() -> None:
+    result = subprocess.run(["ps", "-eo", "pid,comm,pcpu,pmem", "--sort=-pcpu"],
+                            check=False, capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise RuntimeError("The process list could not be read")
+    rows = result.stdout.splitlines()
+    print("Top processes by CPU (read-only; command names only):")
+    print("\n".join(rows[:16]))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -438,6 +895,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "about":
             print(f"Neverbandits {__version__} | Publisher: ISPbandits Dev | {NOTICE}")
+        elif args.command == "reboot":
+            if os.geteuid() != 0:
+                raise PermissionError("Queuing a server reboot requires root")
+            result = subprocess.run(["systemctl", "reboot", "--no-block"], check=False,
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "systemd rejected the reboot request")
+            print("Server reboot queued. Existing sessions will disconnect; no external service check is implied.")
+        elif args.command == "service-restart":
+            if args.confirm != "RESTART":
+                raise ValueError("Managed service restart requires exact RESTART confirmation")
+            _restart_managed_services()
+        elif args.command == "tls-renew":
+            if args.confirm != "RENEW":
+                raise ValueError("Certificate renewal requires exact RENEW confirmation")
+            _renew_managed_tls()
+        elif args.command == "bandwidth":
+            _host_bandwidth()
+        elif args.command == "process-list":
+            _process_list()
         elif args.command == "init":
             database.initialize(path)
             print(f"Database ready: {path}")
@@ -445,98 +922,14 @@ def main(argv: list[str] | None = None) -> int:
             user_id = database.add_user(path, args.username, args.expires, args.max_logins, args.limit_bytes)
             print(f"Created account record id={user_id} username={args.username}; protocol provisioning is not yet enabled.")
         elif args.command == "account-create":
-            if os.geteuid() != 0:
-                raise PermissionError("Creating managed system accounts requires root")
-            if args.limit_gb < 0:
-                raise ValueError("--limit-gb must be zero or greater")
-            if args.limit_gb and not _ssh_meter_ready(path):
-                raise RuntimeError("A shared lifetime quota requires an active experimental SSH meter and a fresh valid snapshot")
-            if _ssh_meter_timer_active() and "dropbear" in args.protocols:
-                raise ValueError("Dropbear is unsupported by the experimental per-user meter; do not provision it while SSH metering is active")
-            install_info = _install_info()
-            if install_info.get("full_xray") != "1":
-                raise RuntimeError("A full Neverbandits network deployment is required before creating protocol accounts; foundation-only installs are for development and CI")
-            if any(protocol in args.protocols for protocol in ("vless", "trojan")):
-                if not install_info.get("domain"):
-                    raise RuntimeError("The full install marker has no client hostname; no protocol account was created")
-                if not _xray_service_active():
-                    raise RuntimeError("Xray is not active; no VLESS/Trojan account was created")
-                if "vless" in args.protocols and not _service_active("nginx.service"):
-                    raise RuntimeError("Nginx is not active; no VLESS WebSocket account was created")
-            ssh_ports = _require_working_ssh_login(args.username) if "openssh" in args.protocols else []
-            if "openssh" in args.protocols and install_info.get("full_xray") == "1":
-                if install_info.get("ssh_websocket") != "1":
-                    raise RuntimeError("This full install predates SSH-WebSocket support; deploy Neverbandits on a fresh VPS")
-                if not _sshws_ready():
-                    raise RuntimeError("Nginx or the SSH-WebSocket bridge is not active; no account was created")
-            ssh_password = None
-            if args.prompt_password:
-                if "openssh" not in args.protocols:
-                    raise ValueError("--prompt-password requires openssh in --protocols")
-                ssh_password = getpass.getpass("New SSH password: ")
-                confirmation = getpass.getpass("Confirm SSH password: ")
-                if not ssh_password or ssh_password != confirmation:
-                    raise ValueError("Passwords were empty or did not match; no account was created")
-            result = provisioning.create_managed_account(path, args.username, args.expires,
-                                                          protocols=tuple(args.protocols),
-                                                          data_limit=args.limit_gb * 1_000_000_000,
-                                                          ssh_password=ssh_password)
-            xray_activated = False
-            xray_active = _xray_service_active()
-            xray_managed = xray_active or Path("/etc/ispbandits-dev/xray.json").exists()
-            if result["xray_credentials"]:
-                try:
-                    xray_activated = _reconcile_xray_if_active(path)
-                except Exception as exc:
-                    _rollback_unpublished_account(path, args.username, result["ssh_password"], xray_managed)
-                    raise RuntimeError("Account creation rolled back because Xray config activation failed") from exc
-                if not xray_activated:
-                    try:
-                        _rollback_unpublished_account(path, args.username, result["ssh_password"], xray_managed)
-                    except Exception as rollback_exc:
-                        raise RuntimeError("Xray stopped during account creation and rollback was incomplete") from rollback_exc
-                    raise RuntimeError("Account creation rolled back because Xray stopped before activation")
-            meter_active = _ssh_meter_timer_active()
-            if xray_active or meter_active:
-                try:
-                    _seed_new_account_checkpoints(path, args.username, xray_active, meter_active)
-                except Exception as exc:
-                    try:
-                        _rollback_unpublished_account(path, args.username, result["ssh_password"], xray_managed)
-                    except Exception as rollback_exc:
-                        raise RuntimeError("Counter baseline failed and account rollback was incomplete; Xray was stopped if its configuration could not be reconciled") from rollback_exc
-                    raise RuntimeError("Account creation rolled back because initial traffic-counter checkpoints could not be established") from exc
-            if "openssh" in args.protocols and not _sshws_ready():
-                try:
-                    _rollback_unpublished_account(path, args.username, result["ssh_password"], xray_managed)
-                except Exception as rollback_exc:
-                    raise RuntimeError("SSH-WebSocket service failed before credential disclosure and rollback was incomplete") from rollback_exc
-                raise RuntimeError("Account creation rolled back because the SSH-WebSocket service stopped")
-            if "vless" in args.protocols and not _service_active("nginx.service"):
-                try:
-                    _rollback_unpublished_account(path, args.username, result["ssh_password"], xray_managed)
-                except Exception as rollback_exc:
-                    raise RuntimeError("Nginx failed before credential disclosure and rollback was incomplete") from rollback_exc
-                raise RuntimeError("Account creation rolled back because Nginx stopped")
-            if result["xray_credentials"] and not _xray_service_active():
-                try:
-                    _rollback_unpublished_account(path, args.username, result["ssh_password"], xray_managed)
-                except Exception as rollback_exc:
-                    raise RuntimeError("Xray failed before credential disclosure and rollback was incomplete") from rollback_exc
-                raise RuntimeError("Account creation rolled back because Xray stopped")
-            print(f"Created Neverbandits account: {result['username']} (expires {result['expiry_date']})")
-            if args.limit_gb:
-                print(f"Shared lifetime quota: {args.limit_gb} GB (experimental SSH+Xray enforcement)")
-            if result["ssh_password"]:
-                print(f"SSH password (shown once; store securely): {result['ssh_password']}")
-                print("SSH uses a no-home /bin/false account; admin SSH configuration was not changed.")
-            for credential in result["xray_credentials"]:
-                print(f"{credential['protocol'].upper()} stats identity: {credential['identity']}")
-            _print_connection_details(args.username, result["xray_credentials"],
-                                      bool(result["ssh_password"]), ssh_ports)
-            if result["xray_credentials"]:
-                if xray_activated:
-                    print("VLESS/Trojan identities were added to the validated Xray config and activated.")
+            _create_managed_account(path, args.username, args.expires, args.limit_gb,
+                                    tuple(args.protocols), prompt_password=args.prompt_password)
+        elif args.command == "sshws-create":
+            _interactive_protocol_create(path, "openssh")
+        elif args.command == "vless-create":
+            _interactive_protocol_create(path, "vless")
+        elif args.command == "trojan-create":
+            _interactive_protocol_create(path, "trojan")
         elif args.command == "account-list":
             rows = database.list_accounts(path)
             if not rows:
@@ -639,7 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.limit_gb < 0:
                 raise ValueError("--limit-gb must be zero or greater")
             if args.limit_gb and not _ssh_meter_ready(path):
-                raise RuntimeError("A shared lifetime quota requires an active experimental SSH meter and a fresh valid snapshot")
+                raise RuntimeError("A shared lifetime quota requires the experimental SSH meter, the full quota collector, and a fresh valid snapshot")
             account = database.get_account(path, args.username)
             protocols = [(str(item["protocol"]), str(item["identity"]))
                          for item in account["protocols"]]
@@ -722,8 +1115,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("A full Neverbandits deployment with a configured hostname is required before provisioning Xray identities")
             if not _xray_service_active():
                 raise RuntimeError("Xray is not active; no protocol credential was created")
-            if args.protocol == "vless" and not _service_active("nginx.service"):
-                raise RuntimeError("Nginx is not active; no VLESS WebSocket credential was created")
+            if not _service_active("nginx.service"):
+                raise RuntimeError("Nginx is not active; no TLS/WebSocket credential was created")
+            account = database.get_account(path, args.username)
+            if int(account["data_limit"]) and not _ssh_meter_ready(path):
+                raise RuntimeError("This account has a lifetime quota; the SSH meter, full quota collector, and fresh snapshot must be active before adding an Xray identity")
             previous = database.get_xray_protocol_state(path, args.username, args.protocol)
             secret = database.create_xray_protocol(path, args.username, args.protocol, rotate=args.rotate)
             try:
@@ -737,7 +1133,7 @@ def main(argv: list[str] | None = None) -> int:
                     subprocess.run(["systemctl", "stop", "ispbandits-xray.service"],
                                    check=False, capture_output=True)
                 raise RuntimeError("Xray credential was not activated; previous database credential restored where possible") from exc
-            if not _xray_service_active() or (args.protocol == "vless" and not _service_active("nginx.service")):
+            if not _xray_service_active() or not _service_active("nginx.service"):
                 try:
                     database.restore_xray_protocol_state(path, args.username, args.protocol, previous)
                     _reconcile_xray_if_active(path)
@@ -745,15 +1141,19 @@ def main(argv: list[str] | None = None) -> int:
                     subprocess.run(["systemctl", "stop", "ispbandits-xray.service"],
                                    check=False, capture_output=True)
                 raise RuntimeError("Xray/Nginx stopped before credential disclosure; previous protocol state was restored where possible")
-            print(f"Provisioned {secret['protocol']} for {secret['username']}")
-            print(f"Xray stats identity: {secret['identity']}")
-            _print_connection_details(args.username, [secret])
-            print("Active Xray configuration was validated and reloaded; the import link contains the one-time credential.")
+            limit_gb = int(account["data_limit"]) // 1_000_000_000
+            _print_connection_details(args.username, [secret],
+                                      expiry_date=str(account["expiry_date"]),
+                                      limit_gb=limit_gb)
+            print("Active Xray configuration is validated; save the one-time import link.")
         elif args.command == "xray-config":
             if os.geteuid() != 0:
                 raise PermissionError("Xray config generation requires root because it contains client credentials")
+            legacy_trojan_port = (args.legacy_trojan_port if args.legacy_trojan_port is not None
+                                  else _legacy_trojan_port())
             config = xray_config.build_config(path, args.cert_file, args.key_file,
-                                             args.vless_port, args.trojan_port, args.api_port)
+                                             args.vless_port, args.trojan_port, args.api_port,
+                                             legacy_trojan_port)
             xray_config.validate_with_xray(config, args.xray_bin)
             if args.check_only:
                 print("Xray accepted the generated configuration; no file was written.")
@@ -770,85 +1170,12 @@ def main(argv: list[str] | None = None) -> int:
             if os.geteuid() != 0:
                 raise PermissionError("Restoring the managed database requires root")
             directory = Path(args.dir) if args.dir else path.parent / "backups"
-            timers = ("ispbandits-collect.timer", "ispbandits-ssh-collect.timer",
-                      "ispbandits-expire.timer", "ispbandits-ssh-meter.timer")
-            services = ("ispbandits-collect.service", "ispbandits-ssh-collect.service",
-                        "ispbandits-expire.service", "ispbandits-ssh-meter.service",
-                        "ispbandits-xray.service")
-            active_units = set()
-            for unit in (*timers, *services):
-                try:
-                    active = subprocess.run(["systemctl", "is-active", "--quiet", unit],
-                                             check=False, capture_output=True, timeout=5).returncode == 0
-                except (OSError, subprocess.TimeoutExpired):
-                    active = False
-                if active:
-                    active_units.add(unit)
-            stopped_units = []
-            pause_failures = []
-            for unit in (*timers, *services):
-                if unit in active_units:
-                    try:
-                        stopped = subprocess.run(["systemctl", "stop", unit], check=False,
-                                                 capture_output=True, timeout=15)
-                        still_active = subprocess.run(["systemctl", "is-active", "--quiet", unit],
-                                                      check=False, capture_output=True, timeout=5).returncode == 0
-                    except (OSError, subprocess.SubprocessError):
-                        pause_failures.append(unit)
-                        break
-                    if stopped.returncode != 0 or still_active:
-                        pause_failures.append(unit)
-                        break
-                    stopped_units.append(unit)
-            if pause_failures:
-                for unit in reversed(stopped_units):
-                    subprocess.run(["systemctl", "start", unit], check=False,
-                                   capture_output=True, timeout=15)
-                raise RuntimeError("Could not quiesce managed units before restore: " + ", ".join(pause_failures))
-            rollback = None
-            resume_errors = []
-            try:
-                rollback = backup.restore_backup(path, args.archive, directory)
-                # Reconcile the persistent config while Xray is stopped, then
-                # start it only if it had been active before the restore.
-                _reconcile_xray_if_active(path)
-                if "ispbandits-xray.service" in active_units:
-                    started = subprocess.run(["systemctl", "start", "ispbandits-xray.service"],
-                                             check=False, capture_output=True, timeout=30)
-                    if started.returncode != 0 or not _xray_service_active():
-                        raise RuntimeError("Restored Xray config did not start; service remains stopped")
-            except Exception as exc:
-                if rollback is not None and rollback.is_file():
-                    try:
-                        backup.restore_backup(path, rollback, directory)
-                        _reconcile_xray_if_active(path)
-                        if "ispbandits-xray.service" in active_units:
-                            subprocess.run(["systemctl", "start", "ispbandits-xray.service"],
-                                           check=False, capture_output=True, timeout=30)
-                    except Exception as rollback_exc:
-                        subprocess.run(["systemctl", "stop", "ispbandits-xray.service"],
-                                       check=False, capture_output=True)
-                        raise RuntimeError("Restore failed and database rollback also failed; Xray was stopped") from rollback_exc
-                raise RuntimeError("Restore failed; the rollback database was restored where available") from exc
-            finally:
-                for unit in timers:
-                    if unit in active_units:
-                        try:
-                            resumed = subprocess.run(["systemctl", "start", unit], check=False,
-                                                     capture_output=True, timeout=15)
-                            failed = resumed.returncode != 0
-                        except (OSError, subprocess.SubprocessError):
-                            failed = True
-                        if failed:
-                            resume_errors.append(unit)
+            rollback = _restore_managed_database(path, args.archive, directory)
             if rollback:
                 print(f"Restore complete. Previous database saved at: {rollback}")
             else:
                 print("Restore complete. No previous database existed to back up.")
-            print("Managed database writers were quiesced; previously active timers were resumed.")
-            if resume_errors:
-                print("WARNING: these previously active timers did not resume: " + ", ".join(resume_errors),
-                      file=sys.stderr)
+            print("Archive integrity was validated before service quiescence; previously active managed units were resumed.")
         elif args.command == "verify":
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
@@ -882,6 +1209,11 @@ def main(argv: list[str] | None = None) -> int:
             subprocess.SubprocessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+def menu_main() -> int:
+    """Console-script entrypoint for the literal `menu` command."""
+    return main(["menu"])
 
 
 if __name__ == "__main__":

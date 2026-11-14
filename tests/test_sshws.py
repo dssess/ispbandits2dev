@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from ispbandits import cli, database, provisioning, xray_config
 
@@ -27,7 +27,7 @@ class SSHWebSocketTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_xray_config_uses_loopback_vless_ws_and_keeps_trojan_tls(self):
+    def test_xray_config_uses_loopback_vless_and_trojan_ws_with_optional_legacy_tls(self):
         with patch.object(xray_config, "_validate_tls", return_value=("/cert.pem", "/key.pem")):
             config = xray_config.build_config(self.db, "/cert.pem", "/key.pem")
         inbounds = {item["protocol"]: item for item in config["inbounds"]}
@@ -38,48 +38,139 @@ class SSHWebSocketTests(unittest.TestCase):
         self.assertEqual("none", vless["streamSettings"]["security"])
         self.assertEqual("/vless", vless["streamSettings"]["wsSettings"]["path"])
         trojan = inbounds["trojan"]
-        self.assertEqual(8443, trojan["port"])
-        self.assertEqual("0.0.0.0", trojan["listen"])
-        self.assertEqual("tls", trojan["streamSettings"]["security"])
+        self.assertEqual(10002, trojan["port"])
+        self.assertEqual("127.0.0.1", trojan["listen"])
+        self.assertEqual("ws", trojan["streamSettings"]["network"])
+        self.assertEqual("none", trojan["streamSettings"]["security"])
+        self.assertEqual("/trojan-ws", trojan["streamSettings"]["wsSettings"]["path"])
+        self.assertEqual(2, len(config["inbounds"]))
+
+        with patch.object(xray_config, "_validate_tls", return_value=("/cert.pem", "/key.pem")):
+            compatible = xray_config.build_config(
+                self.db, "/cert.pem", "/key.pem", legacy_trojan_port=8443)
+        legacy = next(item for item in compatible["inbounds"] if item["tag"] == "trojan-tls-legacy")
+        self.assertEqual(8443, legacy["port"])
+        self.assertEqual("0.0.0.0", legacy["listen"])
+        self.assertEqual("tls", legacy["streamSettings"]["security"])
         self.assertEqual("127.0.0.1:10085", config["api"]["listen"])
 
-    def test_connection_sheet_includes_ws_wss_vless_ws_and_trojan(self):
-        credentials = [
-            {"protocol": "vless", "credential": "11111111-1111-4111-8111-111111111111"},
-            {"protocol": "trojan", "credential": "secret-value"},
-        ]
+    def test_http_custom_ssh_connection_sheet_is_copyable_and_ssh_only(self):
         with patch.object(cli, "_install_info", return_value={"domain": "vpn.example.test"}), \
-             patch.object(cli, "_sshws_ready", return_value=True), \
+             patch.object(cli, "_ssh_http_ready", return_value=True), \
              patch.object(cli.subprocess, "run", return_value=SimpleNamespace(
                  returncode=0, stdout="203.0.113.42 STREAM vpn.example.test\n", stderr="")), \
              patch("sys.stdout", new_callable=io.StringIO) as output:
-            cli._print_connection_details("alice", credentials, has_ssh=True, ssh_ports=[2222])
+            cli._print_connection_details("alice", [], has_ssh=True, ssh_ports=[2222],
+                                          expiry_date="2026-12-13", ssh_password="ssh-secret")
         rendered = output.getvalue()
-        self.assertIn("Host/domain: vpn.example.test", rendered)
+        self.assertIn("NEVERBANDITS  |  ACCOUNT READY", rendered)
         self.assertIn("203.0.113.42", rendered)
-        self.assertIn("Direct SSH: host vpn.example.test; port(s) 2222", rendered)
-        self.assertIn("ws://vpn.example.test:80/sshws", rendered)
-        self.assertIn("wss://vpn.example.test:443/sshws", rendered)
-        self.assertIn("GET /sshws HTTP/1.1", rendered)
+        self.assertIn("Username        : alice", rendered)
+        self.assertIn("Password        : ssh-secret", rendered)
+        self.assertIn("Expires         : 2026-12-13", rendered)
+        self.assertIn("SSH  |  HTTP CUSTOM  |  TCP PORT 80", rendered)
+        self.assertIn("Server          : vpn.example.test", rendered)
+        self.assertIn("Payload (copy into HTTP Custom):", rendered)
+        self.assertIn("GET / HTTP/1.1[crlf]Host: vpn.example.test[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]", rendered)
+        self.assertIn("SSH is on port 80 only", rendered)
+        self.assertNotIn("wss://", rendered)
+        self.assertNotIn("vless://", rendered)
+        self.assertNotIn("trojan://", rendered)
+
+    def test_vless_connection_sheet_contains_only_vless_import_link(self):
+        secret = "11111111-1111-4111-8111-111111111111"
+        with patch.object(cli, "_install_info", return_value={"domain": "vpn.example.test"}), \
+             patch.object(cli.subprocess, "run", return_value=SimpleNamespace(
+                 returncode=0, stdout="203.0.113.42 STREAM vpn.example.test\n", stderr="")), \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
+            cli._print_connection_details("alice", [{"protocol": "vless", "credential": secret}],
+                                          expiry_date="2026-12-13")
+        rendered = output.getvalue()
         self.assertIn("type=ws", rendered)
         self.assertIn("path=%2Fvless", rendered)
-        self.assertIn("trojan://secret-value@vpn.example.test:8443", rendered)
-        self.assertEqual(1, rendered.count("secret-value"))
-        self.assertNotIn("client credential:", rendered)
+        self.assertIn(f"vless://{secret}@vpn.example.test:443", rendered)
+        self.assertEqual(1, rendered.count(secret))
+        self.assertNotIn("trojan://", rendered)
+        self.assertNotIn("SSH-WS endpoint", rendered)
 
-    def test_sshws_readiness_checks_recorded_loopback_ssh_port(self):
+    def test_trojan_connection_sheet_contains_only_trojan_import_link(self):
+        secret = "trojan-secret-value"
+        with patch.object(cli, "_install_info", return_value={"domain": "vpn.example.test"}), \
+             patch.object(cli.subprocess, "run", return_value=SimpleNamespace(
+                 returncode=0, stdout="203.0.113.42 STREAM vpn.example.test\n", stderr="")), \
+             patch("sys.stdout", new_callable=io.StringIO) as output:
+            cli._print_connection_details("alice", [{"protocol": "trojan", "credential": secret}],
+                                          expiry_date="2026-12-13")
+        rendered = output.getvalue()
+        self.assertIn(
+            f"trojan://{secret}@vpn.example.test:443?path=%2Ftrojan-ws&security=tls"
+            "&host=vpn.example.test&type=ws&sni=vpn.example.test#TROJAN_WS_alice", rendered)
+        self.assertIn("path=%2Ftrojan-ws", rendered)
+        self.assertIn("security=tls", rendered)
+        self.assertIn("Server          : vpn.example.test:443", rendered)
+        self.assertEqual(1, rendered.count(secret))
+        self.assertNotIn("vless://", rendered)
+        self.assertNotIn("SSH-WS endpoint", rendered)
+
+    def test_interactive_create_commands_provision_only_the_selected_protocol(self):
+        commands = (
+            ("sshws-create", "openssh", ("alice", "14", "0"), "temporary-password"),
+            ("vless-create", "vless", ("bob", "14", "0"), None),
+            ("trojan-create", "trojan", ("carol", "14", "0"), None),
+        )
+        for command, protocol, answers, password in commands:
+            with self.subTest(command=command):
+                inputs = iter(answers)
+                with patch.object(cli.os, "geteuid", return_value=0), \
+                     patch("builtins.input", side_effect=lambda _prompt="": next(inputs)) as prompt_input, \
+                     patch.object(cli.getpass, "getpass", return_value=password) as hidden_prompt, \
+                     patch.object(cli, "_create_managed_account") as create, \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    result = cli.main(["--db", str(self.db), command])
+                self.assertEqual(0, result)
+                username = answers[0]
+                expected_expiry = (dt.date.today() + dt.timedelta(days=14)).isoformat()
+                create.assert_called_once_with(self.db, username, expected_expiry, 0,
+                                               (protocol,), password)
+                expected_prompts = ["Username : "]
+                if protocol == "openssh":
+                    hidden_prompt.assert_called_once_with("Password : ")
+                else:
+                    hidden_prompt.assert_not_called()
+                expected_prompts.append("Expired (days): ")
+                expected_prompts.append("Bandwidth quota (GB, lifetime; 0 = unlimited): ")
+                self.assertEqual(expected_prompts,
+                                 [call.args[0] for call in prompt_input.call_args_list])
+
+    def test_account_create_default_is_not_a_combined_protocol_bundle(self):
+        args = cli.parser().parse_args(["account-create", "alice", "--expires", "2026-12-13"])
+        self.assertEqual(("openssh",), args.protocols)
+
+    def test_interactive_protocol_create_passes_requested_lifetime_quota(self):
+        inputs = iter(("alice", "14", "25"))
+        with patch.object(cli.os, "geteuid", return_value=0), \
+             patch("builtins.input", side_effect=lambda _prompt="": next(inputs)), \
+             patch.object(cli, "_create_managed_account") as create, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            result = cli.main(["--db", str(self.db), "vless-create"])
+        expiry = (dt.date.today() + dt.timedelta(days=14)).isoformat()
+        self.assertEqual(0, result)
+        create.assert_called_once_with(self.db, "alice", expiry, 25, ("vless",), None)
+
+    def test_http_custom_readiness_checks_public_listener_and_recorded_ssh_port(self):
         with patch.object(cli, "_install_info", return_value={
-                "ssh_websocket": "1", "ssh_target_port": "2222"}), \
-             patch.object(cli.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                "ssh_http_custom": "1", "ssh_target_port": "2222"}), \
+             patch.object(cli, "_service_active", return_value=True), \
              patch.object(cli.socket, "create_connection") as connect:
-            self.assertTrue(cli._sshws_ready())
-        connect.assert_called_once_with(("127.0.0.1", 2222), timeout=2)
+            self.assertTrue(cli._ssh_http_ready())
+        self.assertEqual([call(("127.0.0.1", 80), timeout=2),
+                          call(("127.0.0.1", 2222), timeout=2)], connect.call_args_list)
 
         with patch.object(cli, "_install_info", return_value={
-                "ssh_websocket": "1", "ssh_target_port": "2222"}), \
-             patch.object(cli.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                "ssh_http_custom": "1", "ssh_target_port": "2222"}), \
+             patch.object(cli, "_service_active", return_value=True), \
              patch.object(cli.socket, "create_connection", side_effect=OSError("closed")):
-            self.assertFalse(cli._sshws_ready())
+            self.assertFalse(cli._ssh_http_ready())
 
     def test_account_create_hidden_prompt_passes_password_to_provisioning_only(self):
         expiry = (dt.date.today() + dt.timedelta(days=30)).isoformat()
@@ -89,8 +180,8 @@ class SSHWebSocketTests(unittest.TestCase):
              patch.object(cli, "_ssh_meter_timer_active", return_value=False), \
              patch.object(cli, "_require_working_ssh_login", return_value=[22]), \
              patch.object(cli, "_install_info", return_value={
-                 "full_xray": "1", "ssh_websocket": "1", "ssh_target_port": "22"}), \
-             patch.object(cli, "_sshws_ready", return_value=True), \
+                 "full_xray": "1", "ssh_http_custom": "1", "ssh_target_port": "22"}), \
+             patch.object(cli, "_ssh_http_ready", return_value=True), \
              patch.object(cli.provisioning, "create_managed_account", return_value=fake_result) as create, \
              patch.object(cli, "_xray_service_active", return_value=False), \
              patch.object(cli, "_print_connection_details"), \
@@ -121,17 +212,52 @@ class SSHWebSocketTests(unittest.TestCase):
         create.assert_not_called()
 
     def test_vless_creation_refuses_inactive_xray_before_provisioning(self):
-        expiry = (dt.date.today() + dt.timedelta(days=30)).isoformat()
         with patch.object(cli.os, "geteuid", return_value=0), \
              patch.object(cli, "_install_info", return_value={
                  "full_xray": "1", "domain": "vpn.example.test"}), \
              patch.object(cli, "_xray_service_active", return_value=False), \
+             patch("builtins.input", side_effect=("bob", "30", "0")), \
              patch.object(cli.provisioning, "create_managed_account") as create, \
              patch("sys.stderr", new_callable=io.StringIO):
-            result = cli.main(["--db", str(self.db), "account-create", "bob", "--expires", expiry,
-                               "--protocols", "vless"])
+            result = cli.main(["--db", str(self.db), "vless-create"])
         self.assertEqual(2, result)
         create.assert_not_called()
+
+    def test_trojan_creation_refuses_inactive_xray_before_provisioning(self):
+        with patch.object(cli.os, "geteuid", return_value=0), \
+             patch.object(cli, "_install_info", return_value={
+                 "full_xray": "1", "domain": "vpn.example.test"}), \
+             patch.object(cli, "_xray_service_active", return_value=False), \
+             patch("builtins.input", side_effect=("bob", "30", "0")), \
+             patch.object(cli.provisioning, "create_managed_account") as create, \
+             patch("sys.stderr", new_callable=io.StringIO):
+            result = cli.main(["--db", str(self.db), "trojan-create"])
+        self.assertEqual(2, result)
+        create.assert_not_called()
+
+    def test_xray_only_creation_provisions_only_the_selected_protocol(self):
+        expiry = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+        for protocol in ("vless", "trojan"):
+            with self.subTest(protocol=protocol):
+                credential = {"protocol": protocol, "identity": f"alice-{protocol}@xray.invalid",
+                              "credential": f"{protocol}-one-time-secret"}
+                result = {"username": "alice", "expiry_date": expiry,
+                          "ssh_password": None, "xray_credentials": [credential]}
+                with patch.object(cli.os, "geteuid", return_value=0), \
+                     patch.object(cli, "_install_info", return_value={
+                         "full_xray": "1", "domain": "vpn.example.test"}), \
+                     patch.object(cli, "_xray_service_active", return_value=True), \
+                     patch.object(cli, "_service_active", return_value=True), \
+                     patch.object(cli, "_reconcile_xray_if_active", return_value=True), \
+                     patch.object(cli, "_ssh_meter_timer_active", return_value=False), \
+                     patch.object(cli, "_seed_new_account_checkpoints"), \
+                     patch.object(cli.provisioning, "create_managed_account", return_value=result) as create, \
+                     patch.object(cli, "_print_connection_details") as sheet, \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    cli._create_managed_account(self.db, "alice", expiry, 0, (protocol,))
+                self.assertEqual((protocol,), create.call_args.kwargs["protocols"])
+                self.assertEqual([credential], sheet.call_args.args[1])
+                self.assertFalse(sheet.call_args.kwargs.get("has_ssh", False))
 
     def test_quick_install_waits_for_acme_timewait_before_full_install(self):
         source = (ROOT / "quick-install.sh").read_text(encoding="utf-8")
@@ -147,15 +273,18 @@ class SSHWebSocketTests(unittest.TestCase):
         self.assertIn("s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)", source)
         self.assertIn("Required listener address {host}:{port} is unavailable", source)
 
-    def test_nginx_template_routes_only_managed_paths_to_loopback_services(self):
+    def test_nginx_template_leaves_port_80_to_ssh_and_routes_vless_and_trojan_on_443(self):
         template = (ROOT / "nginx" / "neverbandits.conf.in").read_text(encoding="utf-8")
         rendered = template.replace("@DOMAIN@", "vpn.example.test")
-        self.assertIn("listen 80;", rendered)
         self.assertIn("listen 443 ssl;", rendered)
-        self.assertIn("location ^~ /sshws", rendered)
-        self.assertIn("proxy_pass http://127.0.0.1:6080;", rendered)
         self.assertIn("location ^~ /vless", rendered)
         self.assertIn("proxy_pass http://127.0.0.1:10001;", rendered)
+        self.assertIn("location = /trojan-ws", rendered)
+        self.assertIn("proxy_pass http://127.0.0.1:10002;", rendered)
+        self.assertNotIn("listen 80", rendered)
+        self.assertNotIn("/sshws", rendered)
+        self.assertNotIn("6080", rendered)
+        self.assertIn("neverbandits-ssh-http.service", (ROOT / "src" / "ispbandits" / "cli.py").read_text())
         self.assertNotIn("proxy_pass http://127.0.0.1:22", rendered)
         self.assertNotIn("listen 10001", rendered)
 

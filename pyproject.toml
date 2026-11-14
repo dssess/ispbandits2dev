@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ispbandits-dev"
-version = "1.0.0a4"
+version = "1.0.0a6"
 description = "Neverbandits unified VPS management system by ISPbandits Dev — Version 1 alpha"
 requires-python = ">=3.10"
 dependencies = []
@@ -13,6 +13,7 @@ authors = [{ name = "ISPbandits Dev" }]
 [project.scripts]
 neverbandits = "ispbandits.cli:main"
 ispbandits = "ispbandits.cli:main"
+menu = "ispbandits.cli:menu_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

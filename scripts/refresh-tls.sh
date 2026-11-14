@@ -21,7 +21,11 @@ source "$ENV_FILE"
 
 install -d -o root -g "$TLS_GROUP" -m 0750 "$TLS_ROOT/versions"
 TMP=$(mktemp -d "$TLS_ROOT/.incoming.XXXXXX")
-cleanup() { [[ -z "${TMP:-}" ]] || rm -rf -- "$TMP"; }
+cleanup() {
+  [[ -z "${TMP:-}" ]] || rm -rf -- "$TMP"
+  [[ -z "${LINK:-}" ]] || rm -f -- "$LINK"
+  [[ -z "${ROLLBACK_LINK:-}" ]] || rm -f -- "$ROLLBACK_LINK"
+}
 trap cleanup EXIT
 install -o root -g "$TLS_GROUP" -m 0644 "$TLS_CERT_SOURCE" "$TMP/fullchain.pem"
 install -o root -g "$TLS_GROUP" -m 0640 "$TLS_KEY_SOURCE" "$TMP/privkey.pem"
@@ -42,15 +46,78 @@ else
   TMP=''
 fi
 
-CURRENT=$(readlink -f "$TLS_ROOT/current" 2>/dev/null || true)
-if [[ "$CURRENT" != "$TARGET" ]]; then
+CURRENT_LINK="$TLS_ROOT/current"
+if [[ -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+  echo 'Refusing to replace a non-symlink TLS current path.' >&2
+  exit 1
+fi
+OLD_CURRENT=''
+if [[ -L "$CURRENT_LINK" ]]; then
+  OLD_CURRENT=$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)
+  [[ -n "$OLD_CURRENT" && "$OLD_CURRENT" == "$TLS_ROOT/versions/"* && -d "$OLD_CURRENT" ]] || {
+    echo 'Existing TLS current symlink is broken or points outside the managed versions directory.' >&2
+    exit 1
+  }
+fi
+
+if [[ "$OLD_CURRENT" != "$TARGET" ]]; then
+  XRAY_WAS_ACTIVE=0
+  NGINX_WAS_ACTIVE=0
+  systemctl is-active --quiet "$SERVICE" && XRAY_WAS_ACTIVE=1 || true
+  systemctl is-active --quiet "$NGINX_SERVICE" && NGINX_WAS_ACTIVE=1 || true
+  if [[ -z "$OLD_CURRENT" ]] && (( XRAY_WAS_ACTIVE || NGINX_WAS_ACTIVE )); then
+    echo 'Refusing to change TLS for active managed services because no prior certificate is available for rollback.' >&2
+    exit 1
+  fi
+
   LINK="$TLS_ROOT/.current.$$"
-  ln -s "$TARGET" "$LINK"
-  mv -Tf -- "$LINK" "$TLS_ROOT/current"
-  if systemctl is-active --quiet "$SERVICE"; then
-    systemctl restart "$SERVICE"
+  ln -s -- "$TARGET" "$LINK"
+  mv -Tf -- "$LINK" "$CURRENT_LINK"
+
+  restore_previous_state() {
+    local failed=0
+    if [[ -n "$OLD_CURRENT" ]]; then
+      ROLLBACK_LINK="$TLS_ROOT/.current.rollback.$$"
+      ln -s -- "$OLD_CURRENT" "$ROLLBACK_LINK" && mv -Tf -- "$ROLLBACK_LINK" "$CURRENT_LINK" || failed=1
+    else
+      rm -f -- "$CURRENT_LINK" || failed=1
+    fi
+    if (( XRAY_WAS_ACTIVE )); then
+      systemctl restart "$SERVICE" && systemctl is-active --quiet "$SERVICE" || failed=1
+    fi
+    if (( NGINX_WAS_ACTIVE )); then
+      nginx -t && systemctl reload "$NGINX_SERVICE" && systemctl is-active --quiet "$NGINX_SERVICE" || failed=1
+    fi
+    return "$failed"
+  }
+
+  if (( XRAY_WAS_ACTIVE )); then
+    if ! systemctl restart "$SERVICE" || ! systemctl is-active --quiet "$SERVICE"; then
+      echo 'Xray failed to start with the renewed certificate; restoring the previous certificate and service state.' >&2
+      if ! restore_previous_state; then
+        echo 'CRITICAL: certificate rollback or Xray/Nginx recovery failed; inspect the TLS versions and service journals.' >&2
+      fi
+      exit 1
+    fi
   fi
-  if systemctl is-active --quiet "$NGINX_SERVICE"; then
-    systemctl reload "$NGINX_SERVICE"
+
+  if (( NGINX_WAS_ACTIVE )); then
+    if ! nginx -t; then
+      echo 'Nginx rejected the renewed TLS configuration; restoring the previous certificate and service state.' >&2
+      if ! restore_previous_state; then
+        echo 'CRITICAL: certificate rollback or Xray/Nginx recovery failed; inspect the TLS versions and service journals.' >&2
+      fi
+      exit 1
+    fi
+    if ! systemctl reload "$NGINX_SERVICE" || ! systemctl is-active --quiet "$NGINX_SERVICE"; then
+      echo 'Nginx reload failed with the renewed certificate; restoring the previous certificate and service state.' >&2
+      if ! restore_previous_state; then
+        echo 'CRITICAL: certificate rollback or Xray/Nginx recovery failed; inspect the TLS versions and service journals.' >&2
+      fi
+      exit 1
+    fi
   fi
+  echo "TLS certificate updated and validated: $TLS_DOMAIN (version $VERSION)."
+else
+  echo "TLS certificate is already current and validated: $TLS_DOMAIN (version $VERSION)."
 fi

@@ -1,0 +1,28 @@
+[Unit]
+Description=Neverbandits HTTP Custom SSH relay on TCP port 80
+After=network-online.target ssh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ispbd-ws
+Group=ispbd-ws
+ExecStart=/usr/bin/python3 /opt/ispbandits-dev/src/ispbandits/ssh_http_proxy.py --host 0.0.0.0 --port 80 --target-host 127.0.0.1 --target-port @SSH_PORT@
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

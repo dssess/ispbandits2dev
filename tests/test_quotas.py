@@ -92,6 +92,12 @@ class LifetimeQuotaTests(unittest.TestCase):
         self.assertEqual(2, result)
         create.assert_not_called()
 
+    def test_meter_readiness_requires_full_quota_enforcement_timer(self):
+        with patch.object(cli, "_ssh_meter_timer_active", return_value=True), \
+             patch.object(cli, "_quota_enforcement_timer_active", return_value=False), \
+             patch.object(cli, "_xray_service_active", return_value=True):
+            self.assertFalse(cli._ssh_meter_ready(self.db))
+
     def test_account_create_seeds_xray_checkpoint_before_disclosing_secret(self):
         output = io.StringIO()
         with patch.object(cli.os, "geteuid", return_value=0), \
@@ -113,7 +119,7 @@ class LifetimeQuotaTests(unittest.TestCase):
         conn.close()
         self.assertEqual([("vless", "xray-generation", 0),
                           ("vless", "xray-generation", 0)], checkpoints)
-        self.assertIn("VLESS import link (secret; shown once)", output.getvalue())
+        self.assertIn("VLESS import link (copy; secret shown once)", output.getvalue())
 
     def test_dropbear_provisioning_is_rejected_while_meter_is_active(self):
         with patch.object(cli.os, "geteuid", return_value=0), \

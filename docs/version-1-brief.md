@@ -4,7 +4,7 @@
 
 **Publisher and product:** ISPbandits Dev. The project combines selected workflows from Nginx Bandit and NevermoreSSH into one fresh-install, single-VPS management platform. The source repository is public by the owner's request; the software remains proprietary under `LICENSE.proprietary`. Public visibility is not a grant of reuse rights.
 
-The intended target is a new, clean Ubuntu 22.04/24.04 or Debian 12/13 VPS. This alpha must not be installed over the user's existing NevermoreSSH or Nginx Bandit systems. The full installer supports x86_64 and arm64, provisions Xray VLESS over TLS on TCP 443 and Trojan over TLS on TCP 8443, and leaves the existing administrator SSH daemon/configuration unchanged.
+This document records the original alpha-1 deployment plan. The current alpha-6 candidate targets a new, clean Ubuntu 22.04/24.04 or Debian 12/13 VPS and must not be installed over the user's existing NevermoreSSH or Nginx Bandit systems. The full installer supports x86_64 and arm64, provisions HTTP Custom SSH on TCP 80 plus VLESS and Trojan WebSockets over TLS on TCP 443, and leaves the existing administrator SSH daemon/configuration unchanged. Recognized older Neverbandits installs retain their existing direct Trojan TLS listener on 8443 during migration.
 
 ## Implemented v1 scope
 

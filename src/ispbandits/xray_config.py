@@ -1,4 +1,4 @@
-"""Generate root-protected Xray VLESS-WebSocket and Trojan-TLS configuration.
+"""Generate root-protected Xray VLESS/Trojan WebSocket configuration.
 
 Copyright (c) 2026 ISPbandits Dev. All rights reserved.
 
@@ -86,20 +86,21 @@ def _validate_tls(cert_file: Path | str, key_file: Path | str) -> tuple[str, str
 
 
 def build_config(database: Path | str, cert_file: Path | str, key_file: Path | str,
-                 vless_port: int = 10001, trojan_port: int = 8443,
-                 api_port: int = 10085) -> dict[str, Any]:
+                 vless_port: int = 10001, trojan_port: int = 10002,
+                 api_port: int = 10085,
+                 legacy_trojan_port: int | None = None) -> dict[str, Any]:
     cert, key = _validate_tls(cert_file, key_file)
-    for label, port in (("VLESS", vless_port), ("Trojan", trojan_port), ("API", api_port)):
+    ports = [("VLESS", vless_port), ("Trojan WebSocket", trojan_port), ("API", api_port)]
+    if legacy_trojan_port is not None:
+        ports.append(("Legacy Trojan TLS", legacy_trojan_port))
+    for label, port in ports:
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise XrayConfigError(f"{label} port must be an integer from 1 to 65535")
-    if len({vless_port, trojan_port, api_port}) != 3:
-        raise XrayConfigError("VLESS, Trojan, and API ports must be distinct")
+    if len({port for _label, port in ports}) != len(ports):
+        raise XrayConfigError("VLESS, Trojan WebSocket, API, and legacy ports must be distinct")
 
     vless_users, trojan_users = _accounts(database)
-    tls = {"network": "tcp", "security": "tls", "tlsSettings": {
-        "certificates": [{"certificateFile": cert, "keyFile": key}]
-    }}
-    return {
+    config = {
         "log": {"loglevel": "warning"},
         "api": {"tag": "api", "listen": f"127.0.0.1:{api_port}",
                 "services": ["HandlerService", "StatsService"]},
@@ -117,14 +118,23 @@ def build_config(database: Path | str, cert_file: Path | str, key_file: Path | s
              "tag": "vless-ws", "settings": {"users": vless_users, "decryption": "none"},
              "streamSettings": {"network": "ws", "security": "none",
                                 "wsSettings": {"path": "/vless"}}},
-            {"listen": "0.0.0.0", "port": trojan_port, "protocol": "trojan",
-             "tag": "trojan-tls", "settings": {"users": trojan_users},
-             "streamSettings": {**tls, "tlsSettings": {"certificates": [
-                 {"certificateFile": cert, "keyFile": key}
-             ]}}},
+            {"listen": "127.0.0.1", "port": trojan_port, "protocol": "trojan",
+             "tag": "trojan-ws", "settings": {"users": trojan_users},
+             "streamSettings": {"network": "ws", "security": "none",
+                                "wsSettings": {"path": "/trojan-ws"}}},
         ],
         "outbounds": [{"protocol": "freedom", "tag": "direct"}],
     }
+    if legacy_trojan_port is not None:
+        config["inbounds"].append({
+            "listen": "0.0.0.0", "port": legacy_trojan_port, "protocol": "trojan",
+            "tag": "trojan-tls-legacy", "settings": {"users": trojan_users},
+            "streamSettings": {"network": "tcp", "security": "tls",
+                               "tlsSettings": {"certificates": [
+                                   {"certificateFile": cert, "keyFile": key}
+                               ]}},
+        })
+    return config
 
 
 def validate_with_xray(config: dict[str, Any], xray_bin: str) -> None:
@@ -188,9 +198,11 @@ def write_config(config: dict[str, Any], output: Path | str) -> Path:
 
 
 def generate(database: Path | str, cert_file: Path | str, key_file: Path | str,
-             output: Path | str, vless_port: int = 10001, trojan_port: int = 8443,
-             api_port: int = 10085, xray_bin: str | None = None) -> Path:
-    config = build_config(database, cert_file, key_file, vless_port, trojan_port, api_port)
+             output: Path | str, vless_port: int = 10001, trojan_port: int = 10002,
+             api_port: int = 10085, xray_bin: str | None = None,
+             legacy_trojan_port: int | None = None) -> Path:
+    config = build_config(database, cert_file, key_file, vless_port, trojan_port,
+                          api_port, legacy_trojan_port)
     if xray_bin:
         validate_with_xray(config, xray_bin)
     return write_config(config, output)

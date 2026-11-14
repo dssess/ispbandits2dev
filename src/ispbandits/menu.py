@@ -1,16 +1,24 @@
 """Interactive Neverbandits administration dashboard."""
 from __future__ import annotations
 
-import datetime as dt
+from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, wait
+from io import StringIO
+import json
 import os
 from pathlib import Path
 import platform
 import re
+import shutil
+import sqlite3
 import socket
 import subprocess
 import sys
 
 from . import database
+from . import menu_actions, menu_ui
+from .menu_ui import show_result
 
 NOTICE = "© 2026 ISPbandits Dev. All rights reserved. Proprietary software."
 WIDTH = 68
@@ -25,6 +33,35 @@ class _Colors:
     RED = "\033[1;31m"
     MAGENTA = "\033[1;35m"
     RESET = "\033[0m"
+
+
+class _TeeStream:
+    """Capture emitted CLI text while forwarding it immediately to the terminal."""
+
+    def __init__(self, original: object) -> None:
+        self._original = original
+        self._capture_tail = ""
+
+    def write(self, text: str) -> int:
+        self._capture_tail = (self._capture_tail + text)[-4096:]
+        return self._original.write(text)  # type: ignore[attr-defined, no-any-return]
+
+    def flush(self) -> None:
+        self._original.flush()  # type: ignore[attr-defined]
+
+    def isatty(self) -> bool:
+        return bool(self._original.isatty())  # type: ignore[attr-defined]
+
+    @property
+    def encoding(self) -> str | None:
+        return getattr(self._original, "encoding", None)
+
+    @property
+    def captured_text(self) -> str:
+        return self._capture_tail
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._original, name)
 
 
 def _colors_enabled() -> bool:
@@ -108,17 +145,57 @@ def _domain() -> str:
 def _service_state(unit: str) -> str:
     try:
         result = subprocess.run(["systemctl", "is-active", unit], check=False,
-                                capture_output=True, text=True, timeout=4)
+                                capture_output=True, text=True, timeout=2)
         state = result.stdout.strip() or "inactive"
     except (OSError, subprocess.TimeoutExpired):
         state = "unavailable"
     return state
 
 
+def _collect_checks(checks: list[tuple[str, Callable[[], object]]], timeout: float = 4.0) -> dict[str, str]:
+    """Run bounded independent status probes concurrently; pending probes become unknown."""
+    if not checks:
+        return {}
+    executor = ThreadPoolExecutor(max_workers=min(8, len(checks)))
+    futures = {executor.submit(check): label for label, check in checks}
+    done, pending = wait(futures, timeout=timeout)
+    states: dict[str, str] = {}
+    for future in done:
+        label = futures[future]
+        try:
+            states[label] = str(future.result())
+        except Exception:
+            states[label] = "unavailable"
+    for future in pending:
+        states[futures[future]] = "unknown (probe timed out)"
+        future.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
+    return states
+
+
 def _service_badge(label: str, unit: str) -> str:
     state = _service_state(unit)
     color = _Colors.GREEN if state == "active" else _Colors.RED
     return f"{_paint(label, _Colors.CYAN)} {_paint('[' + state.upper() + ']', color)}"
+
+
+def _tcp_listener_state(host: str, port: int) -> str:
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return "ready"
+    except OSError:
+        return "unreachable"
+
+
+def _xray_api_state() -> str:
+    try:
+        result = subprocess.run(
+            ["/usr/local/bin/xray", "api", "statsquery", "--server=127.0.0.1:10085"],
+            check=False, capture_output=True, text=True, timeout=3,
+        )
+        return "ready" if result.returncode == 0 else "unavailable"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
 
 
 def _server_summary(db_path: Path) -> list[str]:
@@ -155,39 +232,198 @@ def _server_summary(db_path: Path) -> list[str]:
     ]
 
 
-def _show_dashboard(db_path: Path) -> None:
-    print(_frame())
-    print(_box_line(_paint("Neverbandits — VPS Administration", _Colors.WHITE).center(WIDTH)))
-    print(_paint("├" + "─" * WIDTH + "┤", _Colors.CYAN))
-    for line in _server_summary(db_path):
-        print(_box_line("  " + line))
-    print(_paint("├" + "─" * WIDTH + "┤", _Colors.CYAN))
-    services = [
-        _service_badge("XRAY", "ispbandits-xray.service"),
-        _service_badge("NGINX", "nginx.service"),
-        _service_badge("SSH-WS", "neverbandits-websockify.service"),
-        _service_badge("COLLECTOR", "ispbandits-collect.timer"),
-        _service_badge("SSH METER", "ispbandits-ssh-meter.timer"),
-        _service_badge("EXPIRY", "ispbandits-expire.timer"),
-        _service_badge("TLS", "ispbandits-tls-refresh.timer"),
+def _database_counts(db_path: Path) -> dict[str, int] | None:
+    """Read dashboard counts with a short, read-only SQLite timeout."""
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+        try:
+            conn.execute("PRAGMA busy_timeout = 500")
+            rows = conn.execute(
+                "SELECT upper(coalesce(status, 'UNKNOWN')), COUNT(*) FROM users GROUP BY upper(coalesce(status, 'UNKNOWN'))"
+            ).fetchall()
+            measured_bytes = int(conn.execute(
+                "SELECT coalesce(sum(upload_bytes + download_bytes), 0) FROM traffic_totals"
+            ).fetchone()[0])
+            protocol_rows = conn.execute(
+                """SELECT lower(p.protocol), p.user_id
+                   FROM protocol_accounts AS p JOIN users AS u ON u.id=p.user_id
+                   WHERE p.enabled=1 AND upper(coalesce(u.status, ''))='ACTIVE'"""
+            ).fetchall()
+        finally:
+            conn.close()
+        counts = {str(status): int(count) for status, count in rows}
+        protocol_users: dict[str, set[int]] = {"ssh": set(), "vless": set(), "trojan": set()}
+        for protocol, user_id in protocol_rows:
+            protocol = str(protocol)
+            if protocol in {"openssh", "dropbear"}:
+                protocol_users["ssh"].add(int(user_id))
+            elif protocol in {"vless", "trojan"}:
+                protocol_users[protocol].add(int(user_id))
+        return {
+            "total": sum(counts.values()),
+            "active": counts.get("ACTIVE", 0),
+            "disabled": counts.get("DISABLED", 0),
+            "expired": counts.get("EXPIRED", 0),
+            "quota": counts.get("QUOTA_EXCEEDED", 0),
+            "measured_bytes": measured_bytes,
+            "protocol_counts": {key: len(user_ids) for key, user_ids in protocol_users.items()},
+        }
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+
+
+def _memory_percent() -> str:
+    try:
+        values: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            name, _, raw = line.partition(":")
+            if name in {"MemTotal", "MemAvailable"}:
+                values[name] = int(raw.split()[0])
+        total, available = values["MemTotal"], values["MemAvailable"]
+        return f"{max(0, min(100, round((total - available) * 100 / total)))}%"
+    except (OSError, ValueError, KeyError, ZeroDivisionError, IndexError):
+        return "unknown"
+
+
+def _storage_summary() -> str:
+    try:
+        usage = shutil.disk_usage("/")
+        percent = round(usage.used * 100 / usage.total) if usage.total else 0
+        return f"{percent}% used ({usage.used // (1024 ** 3)} / {usage.total // (1024 ** 3)} GiB)"
+    except OSError:
+        return "unavailable"
+
+
+def _public_interface_ip() -> str:
+    """Report a public address assigned locally; do not query an external service."""
+    try:
+        result = subprocess.run(["ip", "-j", "address", "show", "scope", "global"],
+                                check=False, capture_output=True, text=True, timeout=1.5)
+        if result.returncode:
+            return "not detected locally"
+        import ipaddress
+        candidates = []
+        for interface in json.loads(result.stdout or "[]"):
+            for address in interface.get("addr_info", []):
+                raw = address.get("local")
+                if raw:
+                    parsed = ipaddress.ip_address(raw)
+                    if parsed.is_global:
+                        candidates.append((parsed.version != 4, str(parsed)))
+        return sorted(candidates)[0][1] if candidates else "not detected locally"
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        return "not detected locally"
+
+
+def _cpu_details() -> tuple[str, str]:
+    """Read CPU identity/frequency locally; report load, not a fabricated CPU-percent sample."""
+    model = "unknown"
+    frequencies: list[float] = []
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="ascii").splitlines():
+            key, _, value = line.partition(":")
+            if key.strip().lower() == "model name" and model == "unknown":
+                model = value.strip() or model
+            elif key.strip().lower() == "cpu mhz":
+                frequencies.append(float(value.strip()))
+    except (OSError, ValueError):
+        pass
+    cores = os.cpu_count() or 1
+    frequency = f"{max(frequencies):.0f} MHz" if frequencies else "frequency unavailable"
+    try:
+        load = f"load {os.getloadavg()[0]:.2f}"
+    except (OSError, AttributeError):
+        load = "load unavailable"
+    return model, f"{cores} Cores @ {frequency} ({load})"
+
+
+def _uptime_readable() -> str:
+    try:
+        seconds = int(float(Path("/proc/uptime").read_text(encoding="ascii").split()[0]))
+    except (OSError, ValueError, IndexError):
+        return "unknown"
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days} days, {hours} hours"
+    if hours:
+        return f"{hours} hours, {minutes} minutes"
+    return f"{minutes} minutes"
+
+
+def _ssh_unit_state() -> str:
+    state = _service_state("ssh.service")
+    return state if state == "active" else _service_state("sshd.service")
+
+
+def _dashboard_snapshot(db_path: Path) -> dict[str, object]:
+    try:
+        os_info = platform.freedesktop_os_release().get("PRETTY_NAME", platform.system())
+    except (OSError, AttributeError):
+        os_info = platform.system()
+    try:
+        kernel = platform.release()
+    except OSError:
+        kernel = "unknown"
+    counts = _database_counts(db_path)
+    cpu_name, cpu_info = _cpu_details()
+    total = str(counts.get("total", "unavailable")) if counts else "unavailable"
+    active = str(counts.get("active", "unavailable")) if counts else "unavailable"
+    disabled = str(counts.get("disabled", "unavailable")) if counts else "unavailable"
+    measured = (f"{counts.get('measured_bytes', 0) / 1_000_000_000:.3f} GB stored account counters"
+                if counts else "unavailable")
+    overview = [
+        f"OS Linux        : {os_info}",
+        f"Kernel          : {kernel}",
+        f"CPU Name        : {cpu_name}",
+        f"CPU Info        : {cpu_info}",
+        f"Total RAM       : {_memory()} ({_memory_percent()})",
+        f"System Uptime   : {_uptime_readable()}",
+        f"Current Domain  : {_domain()}",
+        f"IP-VPS          : {_public_interface_ip()} (local interface)",
+        "Daily Bandwidth : not collected by this dashboard",
+        f"Total Bandwidth : {measured}",
     ]
-    print(_box_line("  " + "   ".join(services[:3])))
-    print(_box_line("  " + "   ".join(services[3:6])))
-    print(_box_line("  " + services[6]))
-    print(_bottom_frame())
-    print()
-    print(f"  {_paint('[01]', _Colors.WHITE)}  CREATE SSH WEBSOCKET     {_paint('[02]', _Colors.WHITE)}  ACCOUNT USAGE")
-    print(f"  {_paint('[03]', _Colors.WHITE)}  ONLINE SSH               {_paint('[04]', _Colors.WHITE)}  SERVICE STATUS")
-    print(f"  {_paint('[05]', _Colors.WHITE)}  RUN EXPIRY CHECK         {_paint('[06]', _Colors.WHITE)}  BACKUP DATABASE")
-    print(f"  {_paint('[07]', _Colors.WHITE)}  VERIFY DATABASE          {_paint('[08]', _Colors.WHITE)}  SET LIFETIME QUOTA")
-    print(f"  {_paint('[09]', _Colors.WHITE)}  LIST ACCOUNTS             {_paint('[10]', _Colors.WHITE)}  ACCOUNT DETAILS")
-    print(f"  {_paint('[11]', _Colors.WHITE)}  RENEW ACCOUNT             {_paint('[12]', _Colors.WHITE)}  DISABLE ACCOUNT")
-    print(f"  {_paint('[13]', _Colors.WHITE)}  ENABLE ACCOUNT            {_paint('[14]', _Colors.WHITE)}  RESET SSH PASSWORD")
-    print(f"  {_paint('[15]', _Colors.WHITE)}  DELETE ACCOUNT            {_paint('[16]', _Colors.WHITE)}  RESTORE DATABASE")
-    print(f"  {_paint('[00]', _Colors.RED)}  EXIT")
-    print()
-    print(_paint(f"  Neverbandits alpha  |  {NOTICE}", _Colors.CYAN))
-    print(_paint("  Experimental SSH meter is opt-in; validate per-session attribution before quota use.", _Colors.YELLOW))
+    account_rows = [
+        f"TOTAL ACCOUNTS     {total}",
+        f"ACTIVE ACCOUNTS    {active}",
+        f"DISABLED ACCOUNTS  {disabled}",
+        (f"EXPIRED / QUOTA    {counts.get('expired', 'unavailable')} / {counts.get('quota', 'unavailable')}"
+         if counts else "EXPIRED / QUOTA    unavailable"),
+        f"Measured account traffic: {measured}",
+        "ONLINE SSH         Not sampled on dashboard; see Traffic & Quota (approximate process counts)",
+    ]
+    service_checks = [
+        ("SSH unit", _ssh_unit_state),
+        ("NGINX unit", lambda: _service_state("nginx.service")),
+        ("XRAY unit", lambda: _service_state("ispbandits-xray.service")),
+        ("DROPBEAR unit", lambda: _service_state("dropbear.service")),
+        ("SSH-WS unit", lambda: _service_state("neverbandits-ssh-http.service")),
+        ("SSH-WS port", lambda: _tcp_listener_state("127.0.0.1", 80)),
+        ("VLESS port", lambda: _tcp_listener_state("127.0.0.1", 10001)),
+        ("TROJAN port", lambda: _tcp_listener_state("127.0.0.1", 10002)),
+    ]
+    service_states = _collect_checks(service_checks)
+    health = [(label, service_states.get(label, "unavailable")) for label, _ in service_checks]
+    health.append(("DATABASE", "available" if counts is not None else "unavailable"))
+    protocol_counts = counts.get("protocol_counts") if counts else None
+    return {"overview": overview, "health": health, "accounts": account_rows,
+            "protocol_counts": protocol_counts}
+
+
+_QUICK_ACTION_LABELS = tuple(
+    f"[{item.key.zfill(2) if item.key.isdigit() and len(item.key) < 2 else item.key}] {item.label}"
+    for item in menu_actions.REFERENCE_MENU
+)
+
+
+def _show_dashboard(db_path: Path) -> None:
+    sections = [(key, str(menu_actions.SECTIONS[key]["title"]))
+                for key in menu_actions.MAIN_SECTIONS]
+    menu_ui.show_dashboard(_dashboard_snapshot(db_path), sections, _QUICK_ACTION_LABELS,
+                           reference_options=menu_actions.REFERENCE_MENU)
 
 
 def _call_cli(db_path: Path, *arguments: str) -> int:
@@ -198,202 +434,341 @@ def _call_cli(db_path: Path, *arguments: str) -> int:
 
 def _pause() -> None:
     try:
-        input("\nPress Enter to return to the dashboard...")
+        input("\nPress Enter to continue...")
     except (EOFError, KeyboardInterrupt):
         pass
 
 
-def _create_account(db_path: Path) -> None:
-    if os.geteuid() != 0:
-        print("Account creation requires root. Start the menu with: sudo ispbandits")
-        return
+def _invoke_cli(db_path: Path, *arguments: str) -> tuple[str, str]:
+    """Run the existing CLI handler, preserve its output, and classify its result."""
+    stderr_capture = StringIO()
+    stdout_tee = _TeeStream(sys.stdout)
     try:
-        username = input("New username: ").strip()
-        if not username:
-            print("Username cannot be empty.")
-            return
-        expiry = input("Expiry date (YYYY-MM-DD): ").strip()
-        expiry_date = dt.date.fromisoformat(expiry)
-        if expiry_date < dt.date.today():
-            print("Expiry date must be today or later.")
-            return
-        quota = int(input("Shared lifetime quota in GB [0 = unlimited]: ").strip() or "0")
-        if quota < 0:
-            print("Quota must be zero or greater.")
-            return
-        print("\nProtocols:")
-        print("  1) SSH WebSocket + VLESS + Trojan (recommended)")
-        print("  2) VLESS + Trojan only")
-        print("  3) SSH WebSocket only")
-        selection = input("Choose protocols [1]: ").strip() or "1"
-        protocol_sets = {
-            "1": ("openssh", "vless", "trojan"),
-            "2": ("vless", "trojan"),
-            "3": ("openssh",),
-        }
-        if selection not in protocol_sets:
-            print("Choose 1, 2, or 3.")
-            return
-        password_option = ("--prompt-password",) if "openssh" in protocol_sets[selection] else ()
-        print("\nCreating account. Store any generated credentials securely; they are shown only once.\n")
-        _call_cli(db_path, "account-create", username, "--expires", expiry,
-                  "--limit-gb", str(quota), "--protocols", *protocol_sets[selection],
-                  *password_option)
+        with redirect_stdout(stdout_tee), redirect_stderr(stderr_capture):
+            return_code = _call_cli(db_path, *arguments)
     except (EOFError, KeyboardInterrupt):
-        print("\nAccount creation cancelled.")
-    except ValueError:
-        print("Invalid date or quota. Use YYYY-MM-DD and a non-negative whole number of GB.")
-    except OSError as exc:
-        print(f"Unable to create account: {exc}")
+        return "CANCELLED", "Operation cancelled; no changes were made."
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+        return "FAILED", str(exc)
+
+    stderr_text = stderr_capture.getvalue()
+    if stderr_text:
+        sys.stderr.write(stderr_text)
+        sys.stderr.flush()
+    if return_code == 0:
+        return "SUCCESS", "Operation completed."
+    combined_output = stdout_tee.captured_text + stderr_text
+    cancellation_signature = "account creation cancelled; no changes were made"
+    output_lines = {line.strip().lower() for line in combined_output.splitlines()}
+    output_lines.update(line.removeprefix("error:").strip()
+                        for line in tuple(output_lines) if line.startswith("error:"))
+    if cancellation_signature in output_lines:
+        return "CANCELLED", "Operation cancelled; no changes were made."
+    return "FAILED", f"Operation failed (CLI exit code {return_code})."
 
 
-def _set_quota(db_path: Path) -> None:
+def _create_protocol_account(db_path: Path, command: str, label: str) -> tuple[str, str]:
     if os.geteuid() != 0:
-        print("Changing account quotas requires root. Start the menu with: sudo ispbandits")
-        return
+        return "FAILED", "Account creation requires root. Start the menu as root: sudo menu"
+    result, message = _invoke_cli(db_path, command)
+    if result == "FAILED":
+        return result, f"{label} account was not created. Correct the reported issue and try again. {message}"
+    return result, message
+
+
+def _set_quota(db_path: Path) -> tuple[str, str]:
+    if os.geteuid() != 0:
+        return "FAILED", "Changing account quotas requires root. Start the menu with: sudo menu"
     try:
         username = input("Account username: ").strip()
+        if not username:
+            return "CANCELLED", "Quota update cancelled; username was empty."
         limit = int(input("New shared lifetime quota in GB [0 = unlimited]: ").strip())
-        if not username or limit < 0:
-            print("Enter a username and a non-negative whole number of GB.")
-            return
-        _call_cli(db_path, "quota-set", username, "--limit-gb", str(limit))
+        if limit < 0:
+            return "FAILED", "Quota must be a non-negative whole number of GB."
+        return _invoke_cli(db_path, "quota-set", username, "--limit-gb", str(limit))
     except (EOFError, KeyboardInterrupt):
-        print("\nQuota update cancelled.")
+        return "CANCELLED", "Quota update cancelled; no changes were made."
     except ValueError:
-        print("Quota must be a non-negative whole number of GB.")
+        return "FAILED", "Quota must be a non-negative whole number of GB."
 
 
-def _root_action(db_path: Path, command: str, prompt: str, extra: tuple[str, ...] = ()) -> None:
+def _root_action(db_path: Path, command: str, prompt: str, extra: tuple[str, ...] = ()) -> tuple[str, str]:
     if os.geteuid() != 0:
-        print(f"This operation requires root. Start the menu with: sudo ispbandits")
-        return
+        return "FAILED", "This operation requires root. Start the menu with: sudo menu"
     try:
         username = input(prompt).strip()
         if not username:
-            print("Username cannot be empty.")
-            return
+            return "CANCELLED", "Operation cancelled; username was empty."
         if command == "renew":
             expiry = input("New expiry date (YYYY-MM-DD): ").strip()
-            _call_cli(db_path, "renew", username, "--expires", expiry)
+            if not expiry:
+                return "CANCELLED", "Renewal cancelled; no changes were made."
+            return _invoke_cli(db_path, "renew", username, "--expires", expiry)
         else:
-            _call_cli(db_path, command, username, *extra)
+            return _invoke_cli(db_path, command, username, *extra)
     except (EOFError, KeyboardInterrupt):
-        print("\nOperation cancelled.")
+        return "CANCELLED", "Operation cancelled; no changes were made."
 
 
-def _delete_account(db_path: Path) -> None:
+def _delete_account(db_path: Path) -> tuple[str, str]:
     if os.geteuid() != 0:
-        print("Account deletion requires root. Start the menu with: sudo ispbandits")
-        return
+        return "FAILED", "Account deletion requires root. Start the menu with: sudo menu"
     try:
         username = input("Account username to permanently delete: ").strip()
         if not username:
-            return
+            return "CANCELLED", "Deletion cancelled; no account was changed."
         confirm = input(f"This permanently deletes {username} and its usage. Type the username again: ").strip()
         if confirm != username:
-            print("Confirmation did not match; no changes made.")
-            return
-        _call_cli(db_path, "account-delete", username, "--yes")
+            return "CANCELLED", "Confirmation did not match; no changes made."
+        return _invoke_cli(db_path, "account-delete", username, "--yes")
     except (EOFError, KeyboardInterrupt):
-        print("\nDeletion cancelled.")
+        return "CANCELLED", "Deletion cancelled; no changes were made."
 
 
-def _restore_database(db_path: Path) -> None:
+def _restore_database(db_path: Path) -> tuple[str, str]:
     if os.geteuid() != 0:
-        print("Database restore requires root. Start the menu with: sudo ispbandits")
-        return
+        return "FAILED", "Database restore requires root. Start the menu with: sudo menu"
     try:
         archive = input("Absolute path to ISPbandits backup archive: ").strip()
         if not archive.startswith("/"):
-            print("Use an absolute archive path; no changes made.")
-            return
+            return "FAILED", "Use an absolute archive path; no changes made."
         confirm = input("Restore replaces the current database; a rollback backup will be saved. Type RESTORE: ").strip()
         if confirm != "RESTORE":
-            print("Restore cancelled; no changes made.")
-            return
-        _call_cli(db_path, "restore", archive, "--dir", "/var/backups/ispbandits-dev")
-        print("Important: database restore does not restore OS accounts, certificates, or service files.")
+            return "CANCELLED", "Restore cancelled; no changes made."
+        result, message = _invoke_cli(db_path, "restore", archive, "--confirm", "RESTORE",
+                                      "--dir", "/var/backups/ispbandits-dev")
+        if result == "SUCCESS":
+            print("Important: database restore does not restore OS accounts, certificates, or service files.")
+        return result, message
     except (EOFError, KeyboardInterrupt):
-        print("\nRestore cancelled.")
+        return "CANCELLED", "Restore cancelled; no changes were made."
 
 
-def _service_status() -> None:
-    units = (
-        ("Xray proxy", "ispbandits-xray.service"),
-        ("Nginx frontend", "nginx.service"),
-        ("SSH-WebSocket bridge", "neverbandits-websockify.service"),
-        ("Xray-only collector", "ispbandits-collect.timer"),
-        ("Experimental SSH meter", "ispbandits-ssh-meter.timer"),
-        ("Full quota collector", "ispbandits-ssh-collect.timer"),
-        ("Expiry timer", "ispbandits-expire.timer"),
-        ("TLS refresh timer", "ispbandits-tls-refresh.timer"),
-    )
-    print("Managed service status:")
-    for label, unit in units:
-        state = _service_state(unit)
-        color = _Colors.GREEN if state == "active" else _Colors.RED
-        print(f"  {label:<26} {_paint(state, color)}")
+def _diagnostic_rows(db_path: Path) -> list[tuple[str, str]]:
+    """Return independent systemd, local endpoint/API, and database checks."""
+    checks = [
+        ("Nginx frontend", lambda: _service_state("nginx.service")),
+        ("Xray core", lambda: _service_state("ispbandits-xray.service")),
+        ("SSH HTTP Custom port 80", lambda: _service_state("neverbandits-ssh-http.service")),
+        ("Nginx TLS listener 127.0.0.1:443", lambda: _tcp_listener_state("127.0.0.1", 443)),
+        ("SSH relay listener 127.0.0.1:80", lambda: _tcp_listener_state("127.0.0.1", 80)),
+        ("Xray StatsService API", _xray_api_state),
+        ("VLESS inbound listener only", lambda: _tcp_listener_state("127.0.0.1", 10001)),
+        ("Trojan inbound listener only", lambda: _tcp_listener_state("127.0.0.1", 10002)),
+        ("Database", lambda: "available" if _database_counts(db_path) is not None else "unavailable"),
+    ]
+    states = _collect_checks(checks, timeout=4.0)
+    return [(label, states.get(label, "unavailable")) for label, _ in checks]
+
+
+def _service_status(db_path: Path | None = None) -> None:
+    menu_ui.show_diagnostics(_diagnostic_rows(db_path or database.DEFAULT_DB))
+
+
+def _execute_action(db_path: Path, action_id: int) -> tuple[str, str]:
+    action = menu_actions.ACTIONS.get(action_id)
+    if action is None:
+        return "FAILED", f"Unknown action ID: {action_id}"
+    if action.requires_root and os.geteuid() != 0:
+        return "FAILED", "This operation requires root. Start the menu with: sudo menu"
+
+    if action.handler == "protocol_create":
+        labels = {1: "HTTP Custom SSH", 2: "VLESS", 3: "Trojan"}
+        return _create_protocol_account(db_path, action.command or "", labels[action_id])
+    if action.handler == "cli":
+        if action_id == 8:
+            return _invoke_cli(db_path, "backup", "--dir", "/var/backups/ispbandits-dev")
+        return _invoke_cli(db_path, action.command or "")
+    if action.handler == "diagnostics":
+        _service_status(db_path)
+        return "SUCCESS", "Diagnostics refreshed; external client connectivity remains untested."
+    if action.handler == "quota":
+        return _set_quota(db_path)
+    if action.handler == "account":
+        prompts = {
+            12: ("account-show", "Account username: "),
+            13: ("renew", "Account username: "),
+            14: ("disable", "Account username to disable: "),
+            15: ("enable", "Account username to enable: "),
+            16: ("ssh-password-reset", "Account username: "),
+        }
+        command, prompt = prompts[action_id]
+        return _root_action(db_path, command, prompt)
+    if action.handler == "delete":
+        return _delete_account(db_path)
+    if action.handler == "restore":
+        return _restore_database(db_path)
+    return "FAILED", f"No menu handler is registered for action {action_id}."
+
+
+def _information_action(db_path: Path, item: str) -> tuple[str, str]:
+    if item == "about":
+        return _invoke_cli(db_path, "about")
+    if item == "version":
+        from . import __version__
+        print(f"Neverbandits installed version: {__version__}")
+        return "SUCCESS", "Version information displayed."
+    if item == "server":
+        menu_ui.panel("NEVERBANDITS / SERVER INFORMATION", _dashboard_snapshot(db_path)["overview"])
+        return "SUCCESS", "Server information displayed."
+    return "FAILED", "Unknown information action."
+
+
+def _confirm_action(db_path: Path, phrase: str, prompt: str, *arguments: str) -> tuple[str, str]:
+    if os.geteuid() != 0:
+        return "FAILED", "This operation requires root. Start the menu with: sudo menu"
+    try:
+        confirmation = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return "CANCELLED", "Operation cancelled; no changes were made."
+    if confirmation != phrase:
+        return "CANCELLED", "Confirmation did not match; no operation was run."
+    return _invoke_cli(db_path, *arguments)
+
+
+def _execute_reference_option(db_path: Path, key: str) -> tuple[str, str]:
+    option = menu_actions.REFERENCE_MENU_BY_KEY.get(key)
+    if option is None:
+        return "FAILED", f"Unknown Nevermore menu option: {key}"
+    if not option.available or option.action is None:
+        return "FAILED", f"{option.label} is unavailable: {option.description}. No command was run."
+    if isinstance(option.action, int):
+        return _execute_action(db_path, option.action)
+    if option.action == "about":
+        return _information_action(db_path, "about")
+    if option.action == "server":
+        return _information_action(db_path, "server")
+    if option.action == "reboot":
+        return _confirm_action(
+            db_path, "REBOOT", "This queues a server reboot and disconnects customers. Type REBOOT: ",
+            "reboot", "--confirm", "REBOOT")
+    if option.action == "restart":
+        return _confirm_action(
+            db_path, "RESTART", "This restarts managed services and may interrupt traffic. Type RESTART: ",
+            "service-restart", "--confirm", "RESTART")
+    if option.action == "tls-renew":
+        return _confirm_action(
+            db_path, "RENEW", "Certbot may briefly pause the port-80 SSH relay. Type RENEW: ",
+            "tls-renew", "--confirm", "RENEW")
+    if option.action in {"bandwidth", "process-list"}:
+        return _invoke_cli(db_path, str(option.action))
+    return "FAILED", f"No safe ISPBandits handler is registered for {option.label}."
+
+
+def _section_actions(section: str) -> list[tuple[str, str, str]]:
+    mapping = menu_actions.SUBMENU_KEYS[section]
+    result = []
+    for local_key, target in mapping.items():
+        if isinstance(target, int):
+            action = menu_actions.ACTIONS[target]
+            result.append((local_key, action.label, action.description or action.command or "Existing operation"))
+        else:
+            labels = {"about": "About Neverbandits", "version": "Installed version", "server": "Server information"}
+            result.append((local_key, labels[target], "Existing application or server information"))
+    return result
+
+
+def _section_extra(db_path: Path, section: str) -> list[str | tuple[str, str]]:
+    if section == "C":
+        return ["Permanent deletion removes the selected account and requires re-entering its username."]
+    if section == "T":
+        timer_checks = [
+            ("Xray collection timer", lambda: _service_state("ispbandits-collect.timer")),
+            ("Experimental SSH meter timer", lambda: _service_state("ispbandits-ssh-meter.timer")),
+            ("Full quota collector timer", lambda: _service_state("ispbandits-ssh-collect.timer")),
+        ]
+        timer_states = _collect_checks(timer_checks)
+        return [
+            (f"{label}: {timer_states.get(label, 'unavailable')}",
+             menu_ui.state_color(timer_states.get(label, "unavailable")))
+            for label, _ in timer_checks
+        ] + [
+            "Quota sampling is not a hard real-time byte cap.",
+        ]
+    if section == "O":
+        return ["SERVER INFORMATION"] + list(_dashboard_snapshot(db_path)["overview"])
+    if section == "S":
+        return ["Password changes affect the selected account.", "Store replacement credentials securely."]
+    if section == "B":
+        return ["Restore replaces the current database.", "Exact RESTORE confirmation is mandatory."]
+    if section == "D":
+        return ["SYSTEMD / LOCAL ENDPOINT / DATABASE RESULTS"] + [
+            (f"{label:<34} {state.upper()}", menu_ui.state_color(state))
+            for label, state in _diagnostic_rows(db_path)
+        ] + [("External client connectivity: NOT TESTED", "yellow")]
+    return []
+
+
+def _dispatch_information(db_path: Path, choice: str) -> tuple[str, str] | None:
+    target = menu_actions.SUBMENU_KEYS["I"].get(choice)
+    if not isinstance(target, str):
+        return None
+    return _information_action(db_path, target)
+
+
+def _dispatch_section_action(db_path: Path, section: str, choice: str) -> tuple[str, str] | None:
+    if section == "I":
+        return _dispatch_information(db_path, choice)
+    target = menu_actions.SUBMENU_KEYS[section].get(choice)
+    return _execute_action(db_path, target) if isinstance(target, int) else None
 
 
 def run_menu(db_path: Path) -> int:
-    """Run the terminal dashboard. Return cleanly on EOF or Ctrl-C."""
+    """Run the interactive NEXUS Control Centre; CLI commands remain the engine."""
     if not sys.stdin.isatty():
-        print("The interactive menu needs a terminal. Run: sudo ispbandits", file=sys.stderr)
+        print("The interactive menu needs a terminal. Run: sudo menu", file=sys.stderr)
         return 2
+
+    section: str | None = None
     while True:
         try:
-            if os.environ.get("TERM") not in {None, "", "dumb"}:
-                subprocess.run(["clear"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            _show_dashboard(db_path)
-            choice = input(" Select menu: ").strip()
+            menu_ui.clear_screen()
+            if section is None:
+                _show_dashboard(db_path)
+                choice = input().strip()
+                if choice in menu_actions.EXIT_KEYS:
+                    print("Goodbye.")
+                    return 0
+                if choice in menu_actions.REFRESH_KEYS:
+                    continue
+                normalized = choice.upper()
+                if normalized in menu_actions.MAIN_SECTIONS:
+                    section = normalized
+                    continue
+                reference_key = str(int(choice)) if choice.isdigit() else choice
+                if reference_key in menu_actions.REFERENCE_MENU_BY_KEY:
+                    result, message = _execute_reference_option(db_path, reference_key)
+                    show_result(result, message)
+                    _pause()
+                    continue
+                show_result("FAILED", "Unknown selection. Choose a displayed option, section key, L, R, or X.")
+                _pause()
+                continue
+
+            section_meta = menu_actions.SECTIONS[section]
+            title = str(section_meta["title"])
+            description = str(section_meta["description"])
+            extra = _section_extra(db_path, section)
+            menu_ui.show_section(section, title, description, _section_actions(section), extra=extra)
+            choice = input().strip()
+            if choice in menu_actions.BACK_KEYS:
+                section = None
+                continue
+            if choice in menu_actions.EXIT_KEYS:
+                print("Goodbye.")
+                return 0
+            if choice in menu_actions.REFRESH_KEYS:
+                continue
+            result = _dispatch_section_action(db_path, section, choice)
+            if result is None:
+                show_result("FAILED", "Unknown selection. Use a displayed action, B to go back, or 0 to exit.")
+            else:
+                show_result(*result)
+            _pause()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting Neverbandits.")
             return 0
-        if choice in {"0", "00", "q", "Q"}:
-            print("Goodbye.")
-            return 0
-        if choice in {"1", "01"}:
-            _create_account(db_path)
-        elif choice in {"2", "02"}:
-            _call_cli(db_path, "usage")
-        elif choice in {"3", "03"}:
-            _call_cli(db_path, "online")
-        elif choice in {"4", "04"}:
-            _service_status()
-        elif choice in {"5", "05"}:
-            if os.geteuid() != 0:
-                print("Expiry maintenance requires root. Start the menu with: sudo ispbandits")
-            else:
-                _call_cli(db_path, "expire")
-        elif choice in {"6", "06"}:
-            if os.geteuid() != 0:
-                print("Backups require root. Start the menu with: sudo ispbandits")
-            else:
-                _call_cli(db_path, "backup", "--dir", "/var/backups/ispbandits-dev")
-        elif choice in {"7", "07"}:
-            _call_cli(db_path, "verify")
-        elif choice in {"8", "08"}:
-            _set_quota(db_path)
-        elif choice in {"9", "09"}:
-            _call_cli(db_path, "account-list")
-        elif choice in {"10"}:
-            _root_action(db_path, "account-show", "Account username: ")
-        elif choice in {"11"}:
-            _root_action(db_path, "renew", "Account username: ")
-        elif choice in {"12"}:
-            _root_action(db_path, "disable", "Account username to disable: ")
-        elif choice in {"13"}:
-            _root_action(db_path, "enable", "Account username to enable: ")
-        elif choice in {"14"}:
-            _root_action(db_path, "ssh-password-reset", "Account username: ")
-        elif choice in {"15"}:
-            _delete_account(db_path)
-        elif choice in {"16"}:
-            _restore_database(db_path)
-        else:
-            print("Unknown option. Choose one of the displayed numbers.")
-        _pause()
 
 
 __all__ = ["run_menu"]

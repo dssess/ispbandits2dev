@@ -1,12 +1,23 @@
-# Neverbandits protocol integration (alpha-4)
+# Neverbandits protocol integration (alpha-6 candidate)
 
-Neverbandits creates distinct VLESS UUIDs and Trojan passwords in the protected SQLite database, then generates a root-protected Xray configuration. VLESS uses WebSocket path `/vless` on Xray loopback port 10001; Nginx terminates TLS and routes it on public TCP 443. Trojan remains Xray TLS/TCP on 8443. Xray StatsService stays on `127.0.0.1:10085`. The generated configuration contains protocol credentials and must remain root-owned and readable only by the Xray service group.
-
-SSH-over-WebSocket is a separate path: public Nginx `/sshws` routes to a loopback-only websockify service, which forwards to the existing sshd port discovered from `sshd -T`. Plain WebSocket is available on port 80 and TLS WebSocket on port 443. The installer does not change OpenSSH settings, install another SSH daemon, or adjust the firewall. Full deployment requires a fresh host, active existing sshd, free public ports, and matching DNS/TLS configuration. See [the SSHWS architecture note](sshws-architecture.md).
-
-## Commands
+Neverbandits creates separate VLESS UUIDs and Trojan passwords in the protected SQLite database, then generates a root-protected Xray configuration. VLESS uses WebSocket path `/vless` on loopback `127.0.0.1:10001`; Trojan uses WebSocket path `/trojan-ws` on loopback `127.0.0.1:10002`. Nginx terminates TLS on public TCP 443 and proxies each path to its separate Xray inbound. Xray StatsService stays on `127.0.0.1:10085`. Trojan receipts now follow Nevermore's URI format, including query order and profile label:
 
 ```text
+trojan://<credential>@<domain>:443?path=%2Ftrojan-ws&security=tls&host=<domain>&type=ws&sni=<domain>#TROJAN_WS_<username>
+```
+
+The ordering is for format compatibility; it does not make encryption stronger by itself. TLS strength comes from the TLS connection and valid certificate, while Trojan authentication uses the credential. A recognized alpha-5 upgrade retains its old direct Trojan TLS listener on TCP 8443, with unchanged account passwords and stats identities, until users migrate; fresh installs do not expose 8443. The generated Xray configuration contains credentials and must remain root-owned and readable only by the Xray service group.
+
+## SSH-over-HTTP Custom
+
+SSH uses a dedicated public TCP port-80 relay that reproduces the Nginx Bandit HTTP Custom flow. It consumes an HTTP-looking client payload, returns the legacy `101 Switching Protocols` response, then relays the SSH stream to the existing local sshd port. New Neverbandits receipts use a conventional `GET / HTTP/1.1` WebSocket-upgrade payload; the earlier CONNECT-style payload is also accepted. SSH is not exposed on port 443. The SSH password is sent to `chpasswd` over stdin and is never stored in SQLite or CLI arguments. See [the HTTP Custom SSH transport note](sshws-architecture.md).
+
+## Commands and creation prompts
+
+```text
+sudo neverbandits sshws-create
+sudo neverbandits vless-create
+sudo neverbandits trojan-create
 neverbandits account-create USER --expires YYYY-MM-DD [--protocols openssh vless trojan] [--prompt-password]
 neverbandits xray-provision USER vless|trojan [--rotate]
 sudo neverbandits xray-config --cert-file CERT --key-file KEY [--check-only]
@@ -17,27 +28,27 @@ sudo neverbandits enable USER
 sudo neverbandits account-delete USER --yes
 ```
 
-`account-create` uses a no-home `/bin/false` Linux account for SSH. For an SSH identity, the dashboard prompts for a password twice without echo; the CLI supports `--prompt-password`. Before creation, Neverbandits checks the existing sshd's effective password-authentication and TCP-forwarding policy. It never alters the SSH daemon or administrator account. Secrets are sent to account tools over stdin, not command-line arguments, and are not stored in the database except Xray credentials, which remain protected for configuration reconciliation. New credentials and connection links are displayed once in the operator's terminal.
+The dashboard's creation actions are independent. SSH prompts in Nevermore's order: username, visible password, expiry days, then lifetime quota in whole GB (`0` means unlimited). VLESS and Trojan each prompt for username, expiry days, and the same quota choice. SSH creates only a no-home `/bin/false` Linux account; VLESS/Trojan create only that Xray protocol. Before SSH creation, Neverbandits checks the existing sshd's effective password-authentication and TCP-forwarding policy. It does not alter sshd or administrator account settings. Receipts are arranged as an account summary plus protocol-specific copy-ready connection sheets.
 
-`xray-provision` and credential rotation require a recognized full alpha-2-or-later install marker, an active Xray service, and active Nginx for VLESS. If activation or a post-activation health check fails, the previous credential state is restored where possible. The one-time credential is contained only in the corresponding import link.
+A nonzero shared quota is accepted only when the experimental SSH meter and the full quota-enforcement collector are active and a fresh valid snapshot exists; otherwise the account is not provisioned. The installer keeps this mode opt-in pending live validation. See [the shared quota contract](ssh-meter-contract.md).
 
-`xray-config` validates through the installed Xray executable before writing a 0640 configuration. `--apply` is intended only after its managed systemd service is installed; it atomically updates configuration and restores the old file if restart fails. Expiry reconciliation stops Xray if its regenerated configuration cannot be activated.
+`xray-provision` and credential rotation require a recognized full install marker, active Xray and active Nginx. If activation or a post-activation health check fails, the previous credential state is restored where possible. The one-time credential is contained only in its protocol-specific import link.
+
+`xray-config` validates through the installed Xray executable before writing a protected configuration. `--apply` atomically updates configuration and restores the prior file if restart fails. For an upgraded alpha-5 installation, config reconciliation preserves both the new Trojan WS inbound and the temporary legacy 8443 inbound using the same stable account identities. Expiry reconciliation stops Xray if the regenerated configuration cannot be activated.
+
+On a fresh full installation, TLS material is validated and staged before the TLS Nginx site is enabled. The installer runs `nginx -t`, enables/starts Nginx, and then checks Nginx TCP 443, the SSH relay service and TCP 80, Xray's service and StatsService API, and the VLESS (`127.0.0.1:10001`) and Trojan (`127.0.0.1:10002`) listeners independently. The menu's SERVICE STATUS screen reports these same units, API, and local listeners independently; a healthy Nginx badge does not imply healthy VLESS/Trojan listeners. These TCP/API checks fail installation on missing required components, but a listener check alone does not prove successful external routing or authenticated client connectivity. Re-running quick-install on a recognized full deployment revalidates health and idempotently ensures Nginx is enabled/running without rewriting the site or database.
 
 ## Traffic and online status
 
 Xray statistics require a `stats` object, per-level `statsUserUplink` and `statsUserDownlink` policy flags, and unique non-empty user `email` identities. The collector maps each identity to one VLESS or Trojan account. `statsUserOnline` is enabled, but the management CLI does not yet display Xray online counts. SSH online status counts matching sshd processes and is not a unique-device count.
 
-The default collector records Xray traffic only. An opt-in experimental OpenSSH producer samples nftables counters and a separate collector can enforce shared lifetime quotas. The meter counts IP-layer bytes, not pure payload, and may overshoot between polls. It has not passed live validation on all supported OS/kernel/OpenSSH combinations; do not use it for billing or hard caps.
+The default collector records Xray traffic only. An opt-in experimental OpenSSH producer samples nftables counters and a separate full collector enforces shared lifetime quotas across managed OpenSSH, VLESS and Trojan. It counts IP-layer bytes, not pure payload, can miss traffic before a session is attributed, and may overshoot between samples. Enforcement polls about every five seconds, so this is not a hard real-time byte ceiling and must not be used for billing or strict production caps.
 
 ## Validation and known limits
 
-The alpha-4 automated tests validate the generated loopback VLESS WS config, Trojan TLS config, connection-sheet details, Nginx routing invariants, ACME post-challenge port handling, and isolation from host-installed Xray configuration. Sandbox integration testing can validate an actual WebSocket handshake and binary forwarding through Nginx to a disposable TCP echo server. The live Ubuntu 24.04 validation also confirmed public HTTP/WSS upgrades, the target sshd banner through the bridge, VLESS WS upgrade, and trusted Trojan TLS. Authenticated Android-client login and other target OS combinations remain unverified.
+Automated tests cover Xray config generation, loopback inbounds and paths, stable user identities, protocol-specific connection sheets, the GET-style and legacy HTTP Custom handshakes, account flow and failure rollback. The SSH relay has been confirmed working on the authorized VPS with the original Android payload. The alpha-6 migration performs an Xray config test, reloads Nginx, applies the dual Trojan listeners, and verifies a local TLS `/trojan-ws` handshake before committing the marker. Android authenticated login using the new GET payload and a real Trojan VPN-client connection remain acceptance tests; additional supported OS/kernel/OpenSSH quota validation is also outstanding.
 
-Xray's [WebSocket transport documentation](https://xtls.github.io/en/config/transports/websocket.html) confirms that WebSocket can be routed by Nginx and describes its path setting. It also recommends evaluating XHTTP for newer deployments because WebSocket can have identifiable traffic characteristics. This alpha uses WS for compatibility and shared-port routing; future protocol work should consider XHTTP without changing the SSHWS service.
-
-The upstream [websockify project](https://github.com/novnc/websockify) describes its WebSocket-to-TCP bridge. Official archives list websockify in [Ubuntu 22.04](https://packages.ubuntu.com/jammy/websockify), [Ubuntu 24.04](https://packages.ubuntu.com/noble/websockify), [Debian 12](https://packages.debian.org/bookworm/websockify), and [Debian 13](https://packages.debian.org/trixie/websockify). Ubuntu hosts may need the Universe repository enabled by their administrator.
-
-## Official references
+## Official Xray references
 
 - [Xray installation](https://xtls.github.io/en/document/install.html)
 - [Xray API](https://xtls.github.io/en/config/api.html)
@@ -46,4 +57,3 @@ The upstream [websockify project](https://github.com/novnc/websockify) describes
 - [Xray VLESS inbound](https://xtls.github.io/en/config/inbounds/vless.html)
 - [Xray Trojan inbound](https://xtls.github.io/en/config/inbounds/trojan.html)
 - [Xray WebSocket transport](https://xtls.github.io/en/config/transports/websocket.html)
-- [Xray CLI](https://xtls.github.io/en/document/command.html)

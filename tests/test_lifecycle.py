@@ -107,6 +107,28 @@ class AccountLifecycleTests(unittest.TestCase):
         self.assertEqual(0, result)
         self.assertEqual(existing_vless, database.get_xray_protocol_state(self.db, "alice", "vless")["secret"])
 
+    def test_ssh_creation_uses_hidden_password_prompt_without_echo(self):
+        secret = "not-for-terminal-output"
+        output = io.StringIO()
+        with patch.object(cli.os, "geteuid", return_value=0), \
+             patch("builtins.input", side_effect=("newuser", "30", "0")), \
+             patch.object(cli.getpass, "getpass", return_value=secret) as hidden_prompt, \
+             patch.object(cli, "_create_managed_account") as create, \
+             patch("sys.stdout", output):
+            cli._interactive_protocol_create(self.db, "openssh")
+        hidden_prompt.assert_called_once_with("Password : ")
+        self.assertEqual(secret, create.call_args.args[-1])
+        self.assertNotIn(secret, output.getvalue())
+
+    def test_ssh_creation_is_root_gated_before_prompting(self):
+        with patch.object(cli.os, "geteuid", return_value=1000), \
+             patch("builtins.input") as prompt, \
+             patch.object(cli.getpass, "getpass") as hidden_prompt:
+            with self.assertRaisesRegex(PermissionError, "requires root"):
+                cli._interactive_protocol_create(self.db, "openssh")
+        prompt.assert_not_called()
+        hidden_prompt.assert_not_called()
+
     def test_failed_xray_rotation_restores_old_credential_and_identity(self):
         conn = sqlite3.connect(self.db)
         conn.execute("UPDATE protocol_accounts SET external_identity='legacy-alice-vless@xray.invalid' WHERE protocol='vless'")
@@ -187,14 +209,50 @@ class AccountLifecycleTests(unittest.TestCase):
         conn.execute("DELETE FROM users")
         conn.commit()
         conn.close()
-        inactive = SimpleNamespace(returncode=3, stdout="inactive", stderr="")
+        inactive = SimpleNamespace(returncode=0, stdout="inactive", stderr="")
         with patch.object(cli.os, "geteuid", return_value=0), \
              patch.object(cli.subprocess, "run", return_value=inactive), \
              patch.object(cli, "_reconcile_xray_if_active", return_value=False):
             result = cli.main(["--db", str(self.db), "restore", str(archive),
-                               "--dir", str(Path(self.tmp.name) / "backups")])
+                               "--confirm", "RESTORE", "--dir", str(Path(self.tmp.name) / "backups")])
         self.assertEqual(0, result)
         self.assertEqual("alice", database.list_accounts(self.db)[0]["username"])
+
+    def test_corrupt_restore_archive_is_rejected_before_systemd_checks(self):
+        archive = backup.create_backup(self.db, Path(self.tmp.name) / "backups")
+        archive.write_bytes(archive.read_bytes()[:32])
+        with patch.object(cli.os, "geteuid", return_value=0), \
+             patch.object(cli.subprocess, "run") as systemctl, \
+             patch("sys.stderr", io.StringIO()):
+            result = cli.main(["--db", str(self.db), "restore", str(archive), "--confirm", "RESTORE"])
+        self.assertEqual(2, result)
+        systemctl.assert_not_called()
+        self.assertEqual("alice", database.get_account(self.db, "alice")["username"])
+
+    def test_restore_rolls_back_database_when_previously_active_xray_cannot_resume(self):
+        archive = backup.create_backup(self.db, Path(self.tmp.name) / "backups")
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE users SET status='DISABLED' WHERE username='alice'")
+        conn.commit()
+        conn.close()
+        xray_active = True
+
+        def systemctl(args, **_kwargs):
+            nonlocal xray_active
+            if args[1] == "show":
+                state = "active" if xray_active and args[-1] == "ispbandits-xray.service" else "inactive"
+                return SimpleNamespace(returncode=0, stdout=state, stderr="")
+            if args[1] == "stop" and args[-1] == "ispbandits-xray.service":
+                xray_active = False
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(cli.os, "geteuid", return_value=0), \
+             patch.object(cli.subprocess, "run", side_effect=systemctl), \
+             patch.object(cli, "_resume_restore_units", side_effect=(["ispbandits-xray.service"], [])), \
+             patch("sys.stderr", io.StringIO()):
+            result = cli.main(["--db", str(self.db), "restore", str(archive), "--confirm", "RESTORE"])
+        self.assertEqual(2, result)
+        self.assertEqual("DISABLED", database.get_account(self.db, "alice")["status"])
 
 
 if __name__ == "__main__":

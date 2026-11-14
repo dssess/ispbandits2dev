@@ -5,13 +5,14 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-REPO_ARCHIVE="https://codeload.github.com/dssess/ispbandits-dev./tar.gz/refs/tags/v1.0.0-alpha.4"
+REPO_ARCHIVE="https://codeload.github.com/dssess/ispbandits2dev/tar.gz/refs/heads/release-candidate/alpha-6"
 DOMAIN=""
 EMAIL=""
 CERT_FILE=""
 KEY_FILE=""
 MODE=""
 UPGRADE=0
+SSH_METER=0
 CERTBOT_PACKAGE_INSTALLED_BY_RUN=0
 CERTBOT_TIMER_RESTORE=0
 CERTBOT_TIMER_ENABLED_BEFORE=0
@@ -22,19 +23,20 @@ QUICK_DEPLOY_SUCCEEDED=0
 
 usage() {
   cat <<'EOF'
-Neverbandits alpha-4 quick installer (publisher: ISPbandits Dev)
+Neverbandits alpha-6 quick installer (publisher: ISPbandits Dev)
 
 Usage:
   sudo bash quick-install.sh [--domain HOSTNAME] [--email EMAIL]
                             [--cert-file CERT --key-file KEY | --self-signed]
+                            [--experimental-ssh-meter]
   sudo bash quick-install.sh --upgrade
 
 If no TLS option is supplied, the script interactively offers Let's Encrypt,
 existing certificate files, or a self-signed certificate (testing only).
 
 Fresh installation is for a new VPS only. --upgrade updates a recognized
-Neverbandits alpha-2/alpha-3/alpha-4 install in code-only mode with database backup and rollback;
-it preserves Xray/Nginx/SSHWS/TLS topology and provider firewall rules.
+Neverbandits alpha-2 through alpha-6 install in code-only mode with database backup and rollback;
+it migrates managed SSH/Trojan routes while preserving legacy Trojan 8443 access during transition.
 EOF
 }
 
@@ -92,6 +94,7 @@ while (($#)); do
       shift 2
       ;;
     --self-signed) MODE=self-signed; shift ;;
+    --experimental-ssh-meter) SSH_METER=1; shift ;;
     --upgrade) UPGRADE=1; shift ;;
     -h|--help) usage; exit 0 ;;
       *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -99,7 +102,7 @@ while (($#)); do
 done
 
 if (( UPGRADE )); then
-  [[ -z "$DOMAIN$EMAIL$CERT_FILE$KEY_FILE$MODE" ]] || fail "Do not combine --upgrade with fresh-install domain or TLS options."
+  [[ -z "$DOMAIN$EMAIL$CERT_FILE$KEY_FILE$MODE" && "$SSH_METER" == 0 ]] || fail "Do not combine --upgrade with fresh-install domain, TLS, or meter options."
   [[ ${EUID} -eq 0 ]] || fail "Run upgrade as root: sudo bash quick-install.sh --upgrade"
   MARKER=/opt/ispbandits-dev/INSTALL_INFO
   [[ -f "$MARKER" ]] || fail "No managed ISPbandits install marker at $MARKER."
@@ -114,9 +117,9 @@ if (( UPGRADE )); then
   esac
   command -v systemctl >/dev/null 2>&1 || fail "A systemd-based managed VPS is required."
   [[ -r /dev/tty ]] || fail "Run the guided upgrade from an interactive terminal."
-  grep -Eq '^version=1\.0\.0-alpha\.(2|3|4)$' "$MARKER" || fail "This release changes network topology; install it on a fresh VPS rather than upgrading an earlier alpha."
-  grep -Fxq 'ssh_websocket=1' "$MARKER" || fail "The existing install does not have the SSH-WebSocket topology; use a fresh VPS."
-  echo "This code-only update backs up SQLite and preserves the existing alpha-2/alpha-3/alpha-4 Nginx/SSHWS/Xray topology."
+  grep -Eq '^version=1\.0\.0-alpha\.(2|3|4|5|6)$' "$MARKER" || fail "This release changes network topology; install it on a fresh VPS rather than upgrading an earlier alpha."
+  grep -Fxq 'ssh_websocket=1' "$MARKER" || fail "The existing install lacks the supported legacy SSH transport marker; use a fresh VPS."
+  echo "This update backs up SQLite, migrates SSH to HTTP Custom on port 80, adds Trojan WebSocket on TLS 443, and retains legacy 8443 access."
   read -r -p "Continue? Type UPGRADE: " CONFIRM </dev/tty
   [[ "$CONFIRM" == UPGRADE ]] || fail "Upgrade cancelled."
   SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -135,6 +138,37 @@ if (( UPGRADE )); then
   [[ -f "$SOURCE_DIR/install.sh" && -f "$SOURCE_DIR/pyproject.toml" ]] || fail "Project source is incomplete."
   bash "$SOURCE_DIR/install.sh" --upgrade
   echo "Upgrade complete. Review the updated guide and run: sudo neverbandits verify"
+  exit 0
+fi
+
+# A repeated quick-install on a recognized full deployment is a safe health
+# recheck; it must not reissue certificates, overwrite config, or touch SQLite.
+EXISTING_MARKER=/opt/ispbandits-dev/INSTALL_INFO
+if [[ -f "$EXISTING_MARKER" ]] &&
+   grep -Fxq 'managed_by=ISPbandits-Dev-install.sh' "$EXISTING_MARKER" &&
+   grep -Fxq 'version=1.0.0-alpha.6' "$EXISTING_MARKER" &&
+   grep -Fxq 'full_xray=1' "$EXISTING_MARKER"; then
+  [[ ${EUID} -eq 0 ]] || fail "Run the existing-install health check as root."
+  [[ -z "$EMAIL$CERT_FILE$KEY_FILE$MODE" && "$SSH_METER" == 0 ]] ||
+    fail "A repeated quick-install only revalidates the existing deployment; omit TLS and meter options."
+  EXISTING_DOMAIN=$(sed -n 's/^domain=//p' "$EXISTING_MARKER" | head -n1)
+  [[ -n "$EXISTING_DOMAIN" ]] || fail "Recognized full-install marker has no domain."
+  [[ -z "$DOMAIN" || "$DOMAIN" == "$EXISTING_DOMAIN" ]] || fail "The supplied domain differs from the existing managed deployment."
+  SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  TMP_DIR=""
+  cleanup_rerun() { [[ -z "$TMP_DIR" ]] || rm -rf -- "$TMP_DIR"; }
+  trap cleanup_rerun EXIT
+  if [[ ! -f "$SOURCE_DIR/install.sh" || ! -f "$SOURCE_DIR/pyproject.toml" ]]; then
+    TMP_DIR=$(mktemp -d /tmp/ispbandits-quick-rerun.XXXXXX)
+    command -v curl >/dev/null 2>&1 || fail "curl is required to fetch the pinned source archive."
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 "$REPO_ARCHIVE" -o "$TMP_DIR/source.tar.gz"
+    verify_source_archive "$TMP_DIR/source.tar.gz" || fail "Downloaded source archive failed safety validation."
+    mkdir "$TMP_DIR/source"
+    tar -xzf "$TMP_DIR/source.tar.gz" --strip-components=1 -C "$TMP_DIR/source"
+    SOURCE_DIR="$TMP_DIR/source"
+  fi
+  [[ -f "$SOURCE_DIR/install.sh" && -f "$SOURCE_DIR/pyproject.toml" ]] || fail "Project source is incomplete."
+  bash "$SOURCE_DIR/install.sh" --full --domain "$EXISTING_DOMAIN"
   exit 0
 fi
 
@@ -177,8 +211,12 @@ if [[ "$MODE" == existing ]]; then
   [[ "$CERT_FILE" == /* && "$KEY_FILE" == /* ]] || fail "Certificate and key paths must be absolute."
   [[ -r "$CERT_FILE" && -r "$KEY_FILE" ]] || fail "Cannot read the supplied certificate or private key."
 elif [[ "$MODE" == letsencrypt ]]; then
-  if [[ -z "$EMAIL" ]]; then prompt EMAIL "Email for Let's Encrypt renewal notices: "; fi
-  [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || fail "Enter a valid email address for certificate registration."
+  if [[ -n "$EMAIL" ]]; then
+    [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || fail "Enter a valid email address supplied with --email."
+    ACME_EMAIL_ARGS=(--email "$EMAIL")
+  else
+    ACME_EMAIL_ARGS=(--register-unsafely-without-email)
+  fi
 fi
 
 [[ ${EUID} -eq 0 ]] || fail "Run as root, for example: sudo bash quick-install.sh"
@@ -200,11 +238,12 @@ cat <<EOF
 
 INSTALLATION WARNING
 This alpha has not yet passed production client-connectivity testing. Use a fresh,
-disposable VPS. It installs Nginx on TCP 80/443, SSH-over-WebSocket, and Xray;
-Trojan uses TCP 8443. SSH per-user
+disposable VPS. It installs HTTP Custom SSH on TCP 80, Nginx TLS on TCP 443, and Xray;
+VLESS and Trojan use separate WebSocket paths on 443. SSH per-user
 traffic metering and shared quota enforcement are experimental and not production-validated.
+The meter is disabled by default. --experimental-ssh-meter opts into sampled quotas that may overshoot.
 
-Before continuing, point $DOMAIN to this VPS, ensure TCP 80, 443, and 8443 are available,
+Before continuing, point $DOMAIN to this VPS, ensure TCP 80 and 443 are available,
 and allow those ports through the VPS/provider firewall. The script cannot edit
 your provider firewall. It will not alter administrator SSH settings.
 EOF
@@ -278,7 +317,7 @@ fi
 
 if [[ "$MODE" == letsencrypt ]]; then
   CERTBOT_ISSUANCE_STARTED=1
-  certbot certonly --standalone --non-interactive --agree-tos --email "$EMAIL" \
+  certbot certonly --standalone --non-interactive --agree-tos "${ACME_EMAIL_ARGS[@]}" \
     --preferred-challenges http -d "$DOMAIN"
   wait_for_acme_http_timewait
   if ! systemctl list-unit-files certbot.timer --no-legend | grep -q '^certbot.timer'; then
@@ -289,16 +328,19 @@ if [[ "$MODE" == letsencrypt ]]; then
   KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 fi
 
+METER_ARGS=()
+if (( SSH_METER )); then METER_ARGS+=(--experimental-ssh-meter); fi
+
 case "$MODE" in
   letsencrypt|existing)
     if [[ "$MODE" == letsencrypt ]]; then
-      bash "$SOURCE_DIR/install.sh" --full --domain "$DOMAIN" --cert-file "$CERT_FILE" --key-file "$KEY_FILE" --certbot-standalone
+      bash "$SOURCE_DIR/install.sh" --full --domain "$DOMAIN" --cert-file "$CERT_FILE" --key-file "$KEY_FILE" --certbot-standalone "${METER_ARGS[@]}"
     else
-      bash "$SOURCE_DIR/install.sh" --full --domain "$DOMAIN" --cert-file "$CERT_FILE" --key-file "$KEY_FILE"
+      bash "$SOURCE_DIR/install.sh" --full --domain "$DOMAIN" --cert-file "$CERT_FILE" --key-file "$KEY_FILE" "${METER_ARGS[@]}"
     fi
     ;;
   self-signed)
-    bash "$SOURCE_DIR/install.sh" --full --domain "$DOMAIN" --self-signed
+    bash "$SOURCE_DIR/install.sh" --full --domain "$DOMAIN" --self-signed "${METER_ARGS[@]}"
     ;;
   *) fail "Internal TLS mode error." ;;
 esac
@@ -306,15 +348,15 @@ QUICK_DEPLOY_SUCCEEDED=1
 
 cat <<'EOF'
 
-Next: create an account with:
-  sudo neverbandits menu
+Next: open the interactive administration menu with:
+  sudo menu
 
-Open TCP 80, 443, and 8443 in the provider firewall. TCP 80 serves plain SSH-WS
-and is also used for Let's Encrypt renewal; TCP 443 serves SSH-WSS/VLESS-WS.
+Open TCP 80 and 443 in the provider firewall. TCP 80 serves HTTP Custom SSH
+and is also used for Let's Encrypt renewal; TCP 443 serves VLESS and Trojan WebSocket over TLS (not SSH).
 Review the README for
 limitations and management commands.
 EOF
 
-if [[ -t 0 && -x /usr/local/bin/neverbandits ]]; then
-  /usr/local/bin/neverbandits menu
+if [[ -t 0 && -x /usr/local/bin/menu ]]; then
+  /usr/local/bin/menu
 fi

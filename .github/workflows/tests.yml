@@ -37,14 +37,37 @@ jobs:
       - name: Validate installer check mode
         run: ./install.sh --check
 
-  sshws-integration:
-    name: Nginx and websockify bridge
+  distro-source-check:
+    name: Installer source checks on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:22.04, ubuntu:24.04, debian:12, debian:13]
+    container:
+      image: ${{ matrix.image }}
+      options: --user root
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install source-check runtime
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y python3
+      - name: Run distro-specific installer source checks
+        run: ./install.sh --check
+
+  ssh-http-integration:
+    name: HTTP Custom SSH relay integration
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-      - name: Install distro bridge packages
-        run: sudo apt-get update && sudo apt-get install -y nginx websockify openssl
-      - name: Test HTTP/WSS WebSocket forwarding
-        run: python3 scripts/test-sshws-integration.py
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test loopback SSH relay behavior
+        run: PYTHONPATH=src python3 scripts/test-sshws-integration.py

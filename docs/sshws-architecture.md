@@ -1,26 +1,27 @@
-# Neverbandits SSH-over-WebSocket architecture
+# Neverbandits HTTP Custom SSH transport
 
 ## Data path
 
-- TCP 80 and 443 terminate at the managed Nginx virtual host. `/sshws` is proxied to a loopback-only websockify listener at `127.0.0.1:6080`; Nginx terminates TLS for WSS on 443.
-- websockify forwards the WebSocket byte stream to `127.0.0.1:<effective-sshd-port>`. It runs as the unprivileged `ispbd-ws` service account and is never bound to a public interface.
-- VLESS uses Xray WebSocket transport on loopback port 10001 and path `/vless`; Nginx terminates TLS and forwards that path on 443. Trojan remains Xray TLS/TCP on 8443. Xray StatsService remains loopback-only on 10085.
-- Existing sshd configuration, administrator credentials, firewall rules, and cloud firewall settings are not changed. Full deployment requires a fresh VPS, free listener ports, and a functioning existing OpenSSH server. Provider firewall rules must allow TCP 80, 443, and 8443.
+- Android clients such as HTTP Custom connect to the VPS on public TCP port 80 and send the legacy Nginx Bandit-style HTTP payload.
+- The dedicated `neverbandits-ssh-http.service` listener consumes the payload, returns the legacy `101 Switching Protocols` response, then relays the SSH byte stream to the existing OpenSSH daemon at `127.0.0.1:<effective-sshd-port>`.
+- The relay is not a general-purpose CONNECT proxy. It has no arbitrary destination option, applies per-IP and global connection limits, bounds/time-limits the initial payload, and runs as the restricted `ispbd-ws` service account with only the capability needed to bind port 80.
+- SSH is advertised only on TCP 80. Neverbandits no longer exposes SSH on 443 or prints a WSS option. SSH still uses OpenSSH authentication and encryption; clients should verify the SSH host key.
+- Nginx listens on TLS port 443 and routes `/vless` and `/trojan-ws` to separate loopback Xray inbounds. The alpha-6 Trojan migration is independent of this SSH transport migration; it keeps the old 8443 listener temporarily for existing clients.
 
-## Account connection sheet
+## Copy sheet and account creation
 
-The numbered menu asks for a username, expiry date, and password entered twice through a hidden prompt. The selected password is sent to `chpasswd` over stdin, never included in a command-line argument, SQLite record, Nginx configuration, or log. The creation response displays it once along with the direct SSH ports, `ws://HOST:80/sshws`, `wss://HOST:443/sshws`, a WebSocket HTTP upgrade payload, and protocol import links.
+The dashboard keeps independent SSH, VLESS, and Trojan creation actions. SSH prompts in Nevermore order: username, visible password, expiry days, then lifetime quota in whole GB (`0` means unlimited). The password is passed to `chpasswd` through stdin and is not stored in SQLite or a command-line argument. The account sheet is arranged by account summary and protocol card, with the server, username, password, expiry, quota and HTTP Custom payload:
 
-The HTTP (port 80) WebSocket path is not TLS-protected. SSH still provides its own authenticated encryption, so clients must verify the SSH host key. For WSS, use a publicly trusted certificate when possible. A self-signed certificate is only for testing and must be explicitly trusted by the client.
+```text
+GET / HTTP/1.1[crlf]Host: HOSTNAME[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]
+```
 
-## Safety rules
+Replace `HOSTNAME` with the configured server domain. The relay routes to the server's local SSH daemon, so the backend SSH port is not the Android client port. The relay still accepts the earlier CONNECT-style Nginx Bandit payload. The account remains SSH-only unless a separate protocol is created.
 
-The full installer is for a clean host only. It refuses occupied ports, a running Nginx listener, pre-existing managed Neverbandits files, and non-default enabled Nginx sites or extra `conf.d` configuration rather than replacing them. It adds its own Nginx site and service unit; it does not rewrite `/etc/ssh/sshd_config`, install a different SSH daemon, or open firewall ports. Code-only upgrade is not a migration path from the earlier 1.0.0-alpha.1 topology; use a fresh VPS for this alpha.
+## Upgrade and certificate renewal
 
-The creation sheet is printed in the local terminal only. Neverbandits does not reproduce Nevermore's public HTTP credential-sheet behavior because exposing passwords through an unauthenticated web path would disclose account credentials.
+On an existing alpha-4 full deployment, run `scripts/migrate-ssh-http80.sh` as root from the new source tree. The migration saves the current managed Nginx site, default-site link, relevant Certbot hooks and new unit path under `/var/backups/ispbandits-dev/`. It stops the legacy bridge, removes Nginx from port 80, removes the SSH path from TLS 443, starts the port-80 relay, and verifies that the local handshake is followed by an actual OpenSSH banner. It restores the previous service files and active state if any migration check fails.
 
-## References
+For standalone Certbot renewal, the pre-hook records whether the SSH port-80 relay was active and stops only that relay so Certbot can bind TCP 80. Nginx serves TLS on 443 and stays online. The post-hook restores the relay only when the pre-hook recorded it as active. During an actual renewal attempt, new SSH-over-port-80 connections are unavailable and stopping the relay can interrupt existing relay sessions; Nginx/TLS service is not stopped. A no-interruption HTTP-01 design would require port-80 challenge routing without moving the confirmed relay endpoint, so that topology change remains a separate review item.
 
-- [websockify upstream project](https://github.com/novnc/websockify) describes its WebSocket-to-TCP proxy and encrypted WebSocket support. The managed service uses the distro executable with explicit `127.0.0.1:6080 127.0.0.1:<sshd-port>` source/target addresses.
-- The [Ubuntu 22.04 Jammy package](https://packages.ubuntu.com/jammy/websockify), [Ubuntu 24.04 Noble package](https://packages.ubuntu.com/noble/websockify), [Debian 12 Bookworm package](https://packages.debian.org/bookworm/websockify), and [Debian 13 Trixie package](https://packages.debian.org/trixie/websockify) are present in the respective official archives. Ubuntu publishes websockify in Universe; a host with that component disabled may need its administrator to enable the repository before installation.
-- [Xray WebSocket transport documentation](https://xtls.github.io/en/config/transports/websocket.html) states that WebSocket transport can be routed by HTTP servers such as Nginx and documents the `wsSettings.path` field used for `/vless`.
+The SSH transport migration does not change SSH daemon configuration, account passwords, Xray credentials, firewall rules, or provider firewall settings. Alpha-6 separately adds Trojan WebSocket on TLS 443 and keeps 8443 available for old Trojan clients until they move. New full installs need public TCP 80 and 443; retain TCP 8443 only on an upgraded server while legacy clients still use it.

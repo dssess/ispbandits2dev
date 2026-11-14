@@ -5,6 +5,8 @@ import datetime as dt
 from pathlib import Path
 import os
 import pwd
+import io
+import tarfile
 from unittest.mock import patch
 
 from ispbandits import backup, collector, database, sessions, provisioning
@@ -55,6 +57,65 @@ class FoundationTests(unittest.TestCase):
         self.assertTrue(rollback.exists())
         conn = sqlite3.connect(self.db)
         self.assertEqual("alice", conn.execute("SELECT username FROM users").fetchone()[0])
+        self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
+        conn.close()
+
+    def test_restore_rejects_invalid_manifest_before_yielding_candidate(self):
+        database.initialize(self.db)
+        database.add_user(self.db, "alice", "2027-02-01")
+        archive = backup.create_backup(self.db, self.backups)
+        with tarfile.open(archive, "r:gz") as source:
+            database_bytes = source.extractfile("database.db").read()
+        with tarfile.open(archive, "w:gz") as target:
+            for name, payload in (("database.db", database_bytes), ("manifest.json", b"{invalid")):
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                target.addfile(info, io.BytesIO(payload))
+        with self.assertRaisesRegex(ValueError, "manifest is invalid JSON"):
+            with backup.prepare_restore(archive, self.root):
+                self.fail("invalid manifest must not yield a restore candidate")
+        self.assertEqual("alice", database.get_account(self.db, "alice")["username"])
+
+    def test_restore_rejects_checksum_mismatch(self):
+        database.initialize(self.db)
+        database.add_user(self.db, "alice", "2027-02-01")
+        archive = backup.create_backup(self.db, self.backups)
+        with tarfile.open(archive, "r:gz") as source:
+            database_bytes = source.extractfile("database.db").read()
+            manifest_bytes = source.extractfile("manifest.json").read()
+        tampered = bytearray(database_bytes)
+        tampered[-1] ^= 1
+        with tarfile.open(archive, "w:gz") as target:
+            for name, payload in (("database.db", bytes(tampered)), ("manifest.json", manifest_bytes)):
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                target.addfile(info, io.BytesIO(payload))
+        with self.assertRaisesRegex(ValueError, "checksum does not match"):
+            with backup.prepare_restore(archive, self.root):
+                self.fail("checksum mismatch must not yield a restore candidate")
+        self.assertEqual("alice", database.get_account(self.db, "alice")["username"])
+
+    def test_failed_atomic_replace_restores_original_database(self):
+        database.initialize(self.db)
+        database.add_user(self.db, "alice", "2027-02-01")
+        archive = backup.create_backup(self.db, self.backups)
+        real_replace = os.replace
+        failed = False
+
+        def fail_candidate_publish(source, target):
+            nonlocal failed
+            if Path(target) == self.db and ".restore." in Path(source).name and not failed:
+                failed = True
+                raise OSError("injected atomic publish failure")
+            return real_replace(source, target)
+
+        with backup.prepare_restore(archive, self.root) as staged, \
+             patch("ispbandits.backup.os.replace", side_effect=fail_candidate_publish):
+            with self.assertRaisesRegex(OSError, "injected atomic publish failure"):
+                backup.install_validated_restore(self.db, staged, self.backups)
+        self.assertTrue(failed)
+        self.assertEqual("alice", database.get_account(self.db, "alice")["username"])
+        conn = sqlite3.connect(self.db)
         self.assertEqual("ok", conn.execute("PRAGMA integrity_check").fetchone()[0])
         conn.close()
 
