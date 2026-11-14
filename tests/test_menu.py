@@ -52,7 +52,8 @@ class MenuTests(unittest.TestCase):
             db_path = Path(directory) / "db.sqlite"
             database.initialize(db_path)
             output = io.StringIO()
-            with patch("sys.stdout", output), patch.object(menu, "_service_state", return_value="active"):
+            with patch.dict("ispbandits.menu_ui.os.environ", {"TERM": "xterm-256color"}), \
+                 patch("sys.stdout", output), patch.object(menu, "_service_state", return_value="active"):
                 menu._show_dashboard(db_path)
         screen = output.getvalue()
         self.assertIn("┌", screen)
